@@ -52,7 +52,7 @@ build = [
   "build ~= 1.2"
 ]
 docs = [
-  "Sphinx ~= 6.0",
+  "Sphinx ~= 8.1",
   "sphinxcontrib-apidoc == 0.5.0",
   "sphinx-autobuild == 2024.2.4",
   "furo ~= 2024.1",
