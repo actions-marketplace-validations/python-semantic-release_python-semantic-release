@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4.2.2
         with:
           fetch-depth: 100 # Must at least retrieve a set of commits to compare changes
           # primarily because of any 'Rebase and Merge' PR action in GitHub
@@ -100,7 +100,7 @@ jobs:
       # the branch was updated. To keep PSR working with the configured release branches,
       # we force a checkout of the desired release branch but at the workflow sha HEAD.
       - name: Setup | Checkout Repository at workflow sha
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.2.2
         with:
           fetch-depth: 0
           ref: ${{ github.sha }}
@@ -125,7 +125,7 @@ jobs:
           build: false
 
       - name: Release | Add distribution artifacts to GitHub Release Assets
-        uses: python-semantic-release/publish-action@v9.14.0
+        uses: python-semantic-release/publish-action@v9.15.0
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           tag: ${{ steps.release.outputs.tag }}
@@ -178,7 +178,7 @@ jobs:
       # the branch was updated. To keep PSR working with the configured release branches,
       # we force a checkout of the desired release branch but at the workflow sha HEAD.
       - name: Setup | Checkout Repository at workflow sha
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.2.2
         with:
           fetch-depth: 1
           ref: ${{ github.sha }}
