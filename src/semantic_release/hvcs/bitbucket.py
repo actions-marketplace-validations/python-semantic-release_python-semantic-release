@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import logging
 import os
 from functools import lru_cache
 from pathlib import PurePosixPath
@@ -14,14 +13,11 @@ from typing import TYPE_CHECKING
 
 from urllib3.util.url import Url, parse_url
 
+from semantic_release.globals import logger
 from semantic_release.hvcs.remote_hvcs_base import RemoteHvcsBase
 
 if TYPE_CHECKING:  # pragma: no cover
     from typing import Any, Callable
-
-
-# Globals
-log = logging.getLogger(__name__)
 
 
 class Bitbucket(RemoteHvcsBase):
@@ -45,6 +41,7 @@ class Bitbucket(RemoteHvcsBase):
     `server.domain/rest/api/1.0` based on the documentation in April 2024.
     """
 
+    OFFICIAL_NAME = "Bitbucket"
     DEFAULT_DOMAIN = "bitbucket.org"
     DEFAULT_API_SUBDOMAIN_PREFIX = "api"
     DEFAULT_API_PATH_CLOUD = "/2.0"
@@ -160,7 +157,7 @@ class Bitbucket(RemoteHvcsBase):
     def _get_repository_owner_and_name(self) -> tuple[str, str]:
         # ref: https://support.atlassian.com/bitbucket-cloud/docs/variables-and-secrets/
         if "BITBUCKET_REPO_FULL_NAME" in os.environ:
-            log.info("Getting repository owner and name from environment variables.")
+            logger.info("Getting repository owner and name from environment variables.")
             owner, name = os.environ["BITBUCKET_REPO_FULL_NAME"].rsplit("/", 1)
             return owner, name
 
@@ -216,6 +213,19 @@ class Bitbucket(RemoteHvcsBase):
 
         return ""
 
+    @staticmethod
+    def format_w_official_vcs_name(format_str: str) -> str:
+        if "%s" in format_str:
+            return format_str % Bitbucket.OFFICIAL_NAME
+
+        if "{}" in format_str:
+            return format_str.format(Bitbucket.OFFICIAL_NAME)
+
+        if "{vcs_name}" in format_str:
+            return format_str.format(vcs_name=Bitbucket.OFFICIAL_NAME)
+
+        return format_str
+
     def get_changelog_context_filters(self) -> tuple[Callable[..., Any], ...]:
         return (
             self.create_server_url,
@@ -223,6 +233,7 @@ class Bitbucket(RemoteHvcsBase):
             self.commit_hash_url,
             self.compare_url,
             self.pull_request_url,
+            self.format_w_official_vcs_name,
         )
 
     def upload_dists(self, tag: str, dist_glob: str) -> int:

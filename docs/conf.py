@@ -1,10 +1,13 @@
 import os
 import sys
+from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.abspath("."))
 sys.path.insert(0, os.path.abspath(".."))
 
 import semantic_release  # noqa: E402
+
+author_name = "Python Semantic Release Team"
 
 # -- General configuration ------------------------------------------------
 
@@ -22,7 +25,8 @@ templates_path = ["_templates"]
 source_suffix = ".rst"
 master_doc = "index"
 project = "python-semantic-release"
-copyright = "2020, Rolf Erik Lekang"  # noqa: A001
+current_year = datetime.now(timezone.utc).astimezone().year
+copyright = f"{current_year}, {author_name}"  # noqa: A001
 
 version = semantic_release.__version__
 release = semantic_release.__version__
@@ -37,14 +41,14 @@ htmlhelp_basename = "python-semantic-releasedoc"
 # -- Automatically run sphinx-apidoc --------------------------------------
 
 docs_path = os.path.dirname(__file__)
-apidoc_output_dir = os.path.join(docs_path, "api")
+apidoc_output_dir = os.path.join(docs_path, "api", "modules")
 apidoc_module_dir = os.path.join(docs_path, "..", "src")
 apidoc_separate_modules = True
 apidoc_module_first = True
 apidoc_extra_args = ["-d", "3"]
 
 
-def setup(app):  # noqa: ARG001,ANN001,ANN201
+def setup(app):  # type: ignore[no-untyped-def]  # noqa: ARG001,ANN001,ANN201
     pass
 
 
@@ -54,7 +58,7 @@ latex_documents = [
         "index",
         "python-semantic-release.tex",
         "python-semantic-release Documentation",
-        "Rolf Erik Lekang",
+        author_name,
         "manual",
     ),
 ]
@@ -66,7 +70,7 @@ man_pages = [
         "index",
         "python-semantic-release",
         "python-semantic-release Documentation",
-        ["Rolf Erik Lekang"],
+        [author_name],
         1,
     )
 ]
@@ -78,7 +82,7 @@ texinfo_documents = [
         "index",
         "python-semantic-release",
         "python-semantic-release Documentation",
-        "Rolf Erik Lekang",
+        author_name,
         "python-semantic-release",
         "One line description of project.",
         "Miscellaneous",
@@ -90,7 +94,7 @@ texinfo_documents = [
 
 # Bibliographic Dublin Core info.
 epub_title = "python-semantic-release"
-epub_author = "Rolf Erik Lekang"
-epub_publisher = "Rolf Erik Lekang"
-epub_copyright = "2020, Rolf Erik Lekang"
+epub_author = author_name
+epub_publisher = author_name
+epub_copyright = copyright
 epub_exclude_files = ["search.html"]

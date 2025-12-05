@@ -3,21 +3,22 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from textwrap import dedent
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import pytest
 import tomlkit
 import yaml
+from dotty_dict import Dotty
 from pytest_lazy_fixtures.lazy_fixture import lf as lazy_fixture
 
-from semantic_release.cli.commands.main import main
+from semantic_release.version.declarations.enum import VersionStampType
 
 from tests.const import EXAMPLE_PROJECT_NAME, MAIN_PROG_NAME, VERSION_SUBCMD
 from tests.fixtures.repos.trunk_based_dev.repo_w_no_tags import (
-    repo_w_no_tags_angular_commits,
+    repo_w_no_tags_conventional_commits,
 )
 from tests.fixtures.repos.trunk_based_dev.repo_w_prereleases import (
-    repo_w_trunk_only_n_prereleases_angular_commits,
+    repo_w_trunk_only_n_prereleases_conventional_commits,
 )
 from tests.util import (
     assert_successful_exit_code,
@@ -27,10 +28,9 @@ from tests.util import (
 if TYPE_CHECKING:
     from unittest.mock import MagicMock
 
-    from click.testing import CliRunner
-    from git import Repo
-
+    from tests.conftest import RunCliFn
     from tests.fixtures.example_project import ExProjectDir, UpdatePyprojectTomlFn
+    from tests.fixtures.git_repo import BuiltRepoResult
 
 
 VERSION_STAMP_CMD = [
@@ -45,31 +45,32 @@ VERSION_STAMP_CMD = [
 
 
 @pytest.mark.parametrize(
-    "repo, expected_new_version",
+    "repo_result, expected_new_version",
     [
         (
-            lazy_fixture(repo_w_trunk_only_n_prereleases_angular_commits.__name__),
+            lazy_fixture(repo_w_trunk_only_n_prereleases_conventional_commits.__name__),
             "0.3.0",
         )
     ],
 )
 def test_version_only_stamp_version(
-    repo: Repo,
+    repo_result: BuiltRepoResult,
     expected_new_version: str,
-    cli_runner: CliRunner,
+    run_cli: RunCliFn,
+    mocked_git_fetch: MagicMock,
     mocked_git_push: MagicMock,
     post_mocker: MagicMock,
     example_pyproject_toml: Path,
     example_project_dir: ExProjectDir,
-    example_changelog_md: Path,
-    example_changelog_rst: Path,
+    pyproject_toml_file: Path,
 ) -> None:
+    repo = repo_result["repo"]
     version_file = example_project_dir.joinpath(
         "src", EXAMPLE_PROJECT_NAME, "_version.py"
     )
     expected_changed_files = sorted(
         [
-            "pyproject.toml",
+            str(pyproject_toml_file),
             str(version_file.relative_to(example_project_dir)),
         ]
     )
@@ -86,26 +87,27 @@ def test_version_only_stamp_version(
     )
 
     # Modify the pyproject.toml to remove the version so we can compare it later
-    pyproject_toml_before["tool"]["poetry"].pop("version")  # type: ignore[attr-defined]
+    pyproject_toml_before.get("tool", {}).get("poetry", {}).pop("version")
 
     # Act (stamp the version but also create the changelog)
     cli_cmd = [*VERSION_STAMP_CMD, "--minor"]
-    result = cli_runner.invoke(main, cli_cmd[1:])
+    result = run_cli(cli_cmd[1:])
 
     # take measurement after running the version command
     head_after = repo.head.commit
     tags_after = {tag.name for tag in repo.tags}
     tags_set_difference = set.difference(tags_after, tags_before)
-    differing_files = [
+    actual_staged_files = [
         # Make sure filepath uses os specific path separators
         str(Path(file))
-        for file in str(repo.git.diff(name_only=True)).splitlines()
+        # Changed files should always be staged
+        for file in cast("str", repo.git.diff(staged=True, name_only=True)).splitlines()
     ]
     pyproject_toml_after = tomlkit.loads(
         example_pyproject_toml.read_text(encoding="utf-8")
     )
-    pyproj_version_after = pyproject_toml_after["tool"]["poetry"].pop(  # type: ignore[attr-defined]
-        "version"
+    pyproj_version_after = (
+        pyproject_toml_after.get("tool", {}).get("poetry", {}).pop("version")
     )
 
     # Load python module for reading the version (ensures the file is valid)
@@ -121,10 +123,10 @@ def test_version_only_stamp_version(
 
     # no push as it should be turned off automatically
     assert mocked_git_push.call_count == 0
-    assert post_mocker.call_count == 0  # no vcs release creation occured
+    assert post_mocker.call_count == 0  # no vcs release creation occurred
 
     # Files that should receive version change
-    assert expected_changed_files == differing_files
+    assert expected_changed_files == actual_staged_files
 
     # Compare pyproject.toml
     assert pyproject_toml_before == pyproject_toml_after
@@ -140,13 +142,13 @@ def test_version_only_stamp_version(
 # ============================================================================== #
 
 
-@pytest.mark.usefixtures(repo_w_no_tags_angular_commits.__name__)
+@pytest.mark.usefixtures(repo_w_no_tags_conventional_commits.__name__)
 def test_stamp_version_variables_python(
-    cli_runner: CliRunner,
+    run_cli: RunCliFn,
     update_pyproject_toml: UpdatePyprojectTomlFn,
     example_project_dir: ExProjectDir,
 ) -> None:
-    new_version = "0.1.0"
+    new_version = "1.0.0"
     target_file = example_project_dir.joinpath(
         "src", EXAMPLE_PROJECT_NAME, "_version.py"
     )
@@ -159,7 +161,7 @@ def test_stamp_version_variables_python(
 
     # Act
     cli_cmd = VERSION_STAMP_CMD
-    result = cli_runner.invoke(main, cli_cmd[1:])
+    result = run_cli(cli_cmd[1:])
 
     # Check the result
     assert_successful_exit_code(result, cli_cmd)
@@ -173,13 +175,69 @@ def test_stamp_version_variables_python(
     assert new_version == version_py_after
 
 
-@pytest.mark.usefixtures(repo_w_no_tags_angular_commits.__name__)
+@pytest.mark.usefixtures(repo_w_no_tags_conventional_commits.__name__)
+def test_stamp_version_toml(
+    run_cli: RunCliFn,
+    update_pyproject_toml: UpdatePyprojectTomlFn,
+    default_tag_format_str: str,
+) -> None:
+    orig_version = "0.0.0"
+    new_version = "1.0.0"
+    orig_release = default_tag_format_str.format(version=orig_version)
+    new_release = default_tag_format_str.format(version=new_version)
+    target_file = Path("example.toml")
+    orig_toml = dedent(
+        f"""\
+        [package]
+        name = "example"
+        version = "{orig_version}"
+        release = "{orig_release}"
+        date-released = "1970-01-01"
+        """
+    )
+
+    orig_toml_obj = Dotty(tomlkit.parse(orig_toml))
+
+    # Write initial text in file
+    target_file.write_text(orig_toml)
+
+    # Set configuration to modify the yaml file
+    update_pyproject_toml(
+        "tool.semantic_release.version_toml",
+        [
+            f"{target_file}:package.version:{VersionStampType.NUMBER_FORMAT.value}",
+            f"{target_file}:package.release:{VersionStampType.TAG_FORMAT.value}",
+        ],
+    )
+
+    # Act
+    cli_cmd = VERSION_STAMP_CMD
+    result = run_cli(cli_cmd[1:])
+
+    # Check the result
+    assert_successful_exit_code(result, cli_cmd)
+
+    # Read content
+    resulting_toml_obj = Dotty(tomlkit.parse(target_file.read_text()))
+
+    # Check the version was updated
+    assert new_version == resulting_toml_obj["package.version"]
+    assert new_release == resulting_toml_obj["package.release"]
+
+    # Check the rest of the content is the same (by resetting the version & comparing)
+    resulting_toml_obj["package.version"] = orig_version
+    resulting_toml_obj["package.release"] = orig_release
+
+    assert orig_toml_obj == resulting_toml_obj
+
+
+@pytest.mark.usefixtures(repo_w_no_tags_conventional_commits.__name__)
 def test_stamp_version_variables_yaml(
-    cli_runner: CliRunner,
+    run_cli: RunCliFn,
     update_pyproject_toml: UpdatePyprojectTomlFn,
 ) -> None:
     orig_version = "0.0.0"
-    new_version = "0.1.0"
+    new_version = "1.0.0"
     target_file = Path("example.yml")
     orig_yaml = dedent(
         f"""\
@@ -199,7 +257,7 @@ def test_stamp_version_variables_yaml(
 
     # Act
     cli_cmd = VERSION_STAMP_CMD
-    result = cli_runner.invoke(main, cli_cmd[1:])
+    result = run_cli(cli_cmd[1:])
 
     # Check the result
     assert_successful_exit_code(result, cli_cmd)
@@ -210,21 +268,27 @@ def test_stamp_version_variables_yaml(
     # Check the version was updated
     assert new_version == resulting_yaml_obj["version"]
 
-    # Check the rest of the content is the same (by reseting the version & comparing)
+    # Check the rest of the content is the same (by resetting the version & comparing)
     resulting_yaml_obj["version"] = orig_version
 
     assert yaml.safe_load(orig_yaml) == resulting_yaml_obj
 
 
-@pytest.mark.usefixtures(repo_w_no_tags_angular_commits.__name__)
+@pytest.mark.usefixtures(repo_w_no_tags_conventional_commits.__name__)
 def test_stamp_version_variables_yaml_cff(
-    cli_runner: CliRunner,
+    run_cli: RunCliFn,
     update_pyproject_toml: UpdatePyprojectTomlFn,
 ) -> None:
+    """
+    Given a yaml file with a top level version directive,
+    When the version command is run,
+    Then the version is updated in the file and the rest of the content is unchanged & parsable
+
+    Based on https://github.com/python-semantic-release/python-semantic-release/issues/962
+    """
     orig_version = "0.0.0"
-    new_version = "0.1.0"
+    new_version = "1.0.0"
     target_file = Path("CITATION.cff")
-    # Derived format from python-semantic-release/python-semantic-release#962
     orig_yaml = dedent(
         f"""\
         ---
@@ -249,7 +313,7 @@ def test_stamp_version_variables_yaml_cff(
 
     # Act
     cli_cmd = VERSION_STAMP_CMD
-    result = cli_runner.invoke(main, cli_cmd[1:])
+    result = run_cli(cli_cmd[1:])
 
     # Check the result
     assert_successful_exit_code(result, cli_cmd)
@@ -260,19 +324,19 @@ def test_stamp_version_variables_yaml_cff(
     # Check the version was updated
     assert new_version == resulting_yaml_obj["version"]
 
-    # Check the rest of the content is the same (by reseting the version & comparing)
+    # Check the rest of the content is the same (by resetting the version & comparing)
     resulting_yaml_obj["version"] = orig_version
 
     assert yaml.safe_load(orig_yaml) == resulting_yaml_obj
 
 
-@pytest.mark.usefixtures(repo_w_no_tags_angular_commits.__name__)
+@pytest.mark.usefixtures(repo_w_no_tags_conventional_commits.__name__)
 def test_stamp_version_variables_json(
-    cli_runner: CliRunner,
+    run_cli: RunCliFn,
     update_pyproject_toml: UpdatePyprojectTomlFn,
 ) -> None:
     orig_version = "0.0.0"
-    new_version = "0.1.0"
+    new_version = "1.0.0"
     target_file = Path("plugins.json")
     orig_json = {
         "id": "test-plugin",
@@ -291,7 +355,7 @@ def test_stamp_version_variables_json(
 
     # Act
     cli_cmd = VERSION_STAMP_CMD
-    result = cli_runner.invoke(main, cli_cmd[1:])
+    result = run_cli(cli_cmd[1:])
 
     # Check the result
     assert_successful_exit_code(result, cli_cmd)
@@ -302,7 +366,135 @@ def test_stamp_version_variables_json(
     # Check the version was updated
     assert new_version == resulting_json_obj["version"]
 
-    # Check the rest of the content is the same (by reseting the version & comparing)
+    # Check the rest of the content is the same (by resetting the version & comparing)
     resulting_json_obj["version"] = orig_version
 
     assert orig_json == resulting_json_obj
+
+
+@pytest.mark.usefixtures(repo_w_no_tags_conventional_commits.__name__)
+def test_stamp_version_variables_yaml_github_actions(
+    run_cli: RunCliFn,
+    update_pyproject_toml: UpdatePyprojectTomlFn,
+    default_tag_format_str: str,
+) -> None:
+    """
+    Given a yaml file with github actions 'uses:' directives which use @vX.Y.Z version declarations,
+    When a version is stamped and configured to stamp the version using the tag format,
+    Then the file is updated with the new version in the tag format
+
+    Based on https://github.com/python-semantic-release/python-semantic-release/issues/1156
+    """
+    orig_version = "0.0.0"
+    new_version = "1.0.0"
+    target_file = Path("combined.yml")
+    action1_yaml_filepath = "my-org/my-actions/.github/workflows/action1.yml"
+    action2_yaml_filepath = "my-org/my-actions/.github/workflows/action2.yml"
+    orig_yaml = dedent(
+        f"""\
+        ---
+        on:
+          workflow_call:
+
+        jobs:
+          action1:
+            uses: {action1_yaml_filepath}@{default_tag_format_str.format(version=orig_version)}
+          action2:
+            uses: {action2_yaml_filepath}@{default_tag_format_str.format(version=orig_version)}
+        """
+    )
+    expected_action1_value = (
+        f"{action1_yaml_filepath}@{default_tag_format_str.format(version=new_version)}"
+    )
+    expected_action2_value = (
+        f"{action2_yaml_filepath}@{default_tag_format_str.format(version=new_version)}"
+    )
+
+    # Setup: Write initial text in file
+    target_file.write_text(orig_yaml)
+
+    # Setup: Set configuration to modify the yaml file
+    update_pyproject_toml(
+        "tool.semantic_release.version_variables",
+        [
+            f"{target_file}:{action1_yaml_filepath}:{VersionStampType.TAG_FORMAT.value}",
+            f"{target_file}:{action2_yaml_filepath}:{VersionStampType.TAG_FORMAT.value}",
+        ],
+    )
+
+    # Act
+    cli_cmd = VERSION_STAMP_CMD
+    result = run_cli(cli_cmd[1:])
+
+    # Check the result
+    assert_successful_exit_code(result, cli_cmd)
+
+    # Read content
+    resulting_yaml_obj = yaml.safe_load(target_file.read_text())
+
+    # Check the version was updated
+    assert expected_action1_value == resulting_yaml_obj["jobs"]["action1"]["uses"]
+    assert expected_action2_value == resulting_yaml_obj["jobs"]["action2"]["uses"]
+
+    # Check the rest of the content is the same (by setting the version & comparing)
+    original_yaml_obj = yaml.safe_load(orig_yaml)
+    original_yaml_obj["jobs"]["action1"]["uses"] = expected_action1_value
+    original_yaml_obj["jobs"]["action2"]["uses"] = expected_action2_value
+
+    assert original_yaml_obj == resulting_yaml_obj
+
+
+@pytest.mark.usefixtures(repo_w_no_tags_conventional_commits.__name__)
+def test_stamp_version_variables_yaml_kustomization_container_spec(
+    run_cli: RunCliFn,
+    update_pyproject_toml: UpdatePyprojectTomlFn,
+    default_tag_format_str: str,
+) -> None:
+    """
+    Given a yaml file with directives that expect a vX.Y.Z version tag declarations,
+    When a version is stamped and configured to stamp the version using the tag format,
+    Then the file is updated with the new version in the tag format
+
+    Based on https://github.com/python-semantic-release/python-semantic-release/issues/846
+    """
+    orig_version = "0.0.0"
+    new_version = "1.0.0"
+    target_file = Path("kustomization.yaml")
+    orig_yaml = dedent(
+        f"""\
+        images:
+          - name: repo/image
+            newTag: {default_tag_format_str.format(version=orig_version)}
+        """
+    )
+    expected_new_tag_value = default_tag_format_str.format(version=new_version)
+
+    # Setup: Write initial text in file
+    target_file.write_text(orig_yaml)
+
+    # Setup: Set configuration to modify the yaml file
+    update_pyproject_toml(
+        "tool.semantic_release.version_variables",
+        [
+            f"{target_file}:newTag:{VersionStampType.TAG_FORMAT.value}",
+        ],
+    )
+
+    # Act
+    cli_cmd = VERSION_STAMP_CMD
+    result = run_cli(cli_cmd[1:])
+
+    # Check the result
+    assert_successful_exit_code(result, cli_cmd)
+
+    # Read content
+    resulting_yaml_obj = yaml.safe_load(target_file.read_text())
+
+    # Check the version was updated
+    assert expected_new_tag_value == resulting_yaml_obj["images"][0]["newTag"]
+
+    # Check the rest of the content is the same (by resetting the version & comparing)
+    original_yaml_obj = yaml.safe_load(orig_yaml)
+    resulting_yaml_obj["images"][0]["newTag"] = original_yaml_obj["images"][0]["newTag"]
+
+    assert original_yaml_obj == resulting_yaml_obj

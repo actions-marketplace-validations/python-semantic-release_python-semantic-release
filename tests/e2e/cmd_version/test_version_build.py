@@ -10,19 +10,17 @@ from unittest import mock
 import pytest
 import shellingham
 import tomlkit
+from flatdict import FlatDict
 from pytest_lazy_fixtures.lazy_fixture import lf as lazy_fixture
 
-from semantic_release.cli.commands.main import main
-
 from tests.const import MAIN_PROG_NAME, VERSION_SUBCMD
-from tests.fixtures.repos import repo_w_trunk_only_angular_commits
+from tests.fixtures.repos import repo_w_trunk_only_conventional_commits
 from tests.util import assert_successful_exit_code, get_func_qual_name
 
 if TYPE_CHECKING:
-    from click.testing import CliRunner
-    from git import Repo
-
+    from tests.conftest import RunCliFn
     from tests.fixtures.example_project import GetWheelFileFn, UpdatePyprojectTomlFn
+    from tests.fixtures.git_repo import BuiltRepoResult
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="Unix only")
@@ -53,30 +51,34 @@ if TYPE_CHECKING:
     or ["sh"],
 )
 @pytest.mark.parametrize(
-    "repo, cli_args, next_release_version",
+    "repo_result, cli_args, next_release_version",
     [
         (
-            lazy_fixture(repo_w_trunk_only_angular_commits.__name__),
+            lazy_fixture(repo_w_trunk_only_conventional_commits.__name__),
             ["--patch"],
             "0.1.2",
         )
     ],
 )
 def test_version_runs_build_command(
-    repo: Repo,
+    repo_result: BuiltRepoResult,
     cli_args: list[str],
     next_release_version: str,
-    cli_runner: CliRunner,
+    run_cli: RunCliFn,
     shell: str,
     get_wheel_file: GetWheelFileFn,
     example_pyproject_toml: Path,
+    mocked_git_fetch: mock.MagicMock,
     mocked_git_push: mock.MagicMock,
     post_mocker: mock.Mock,
 ):
     # Setup
     built_wheel_file = get_wheel_file(next_release_version)
-    pyproject_config = tomlkit.loads(example_pyproject_toml.read_text(encoding="utf-8"))
-    build_command = pyproject_config["tool"]["semantic_release"]["build_command"]  # type: ignore[attr-defined]
+    pyproject_config = FlatDict(
+        tomlkit.loads(example_pyproject_toml.read_text(encoding="utf-8")),
+        delimiter=".",
+    )
+    build_command = pyproject_config.get("tool.semantic_release.build_command", "")
     patched_os_environment = {
         "CI": "true",
         "PATH": os.getenv("PATH", ""),
@@ -96,10 +98,10 @@ def test_version_runs_build_command(
         wraps=subprocess.run,
     ) as patched_subprocess_run, mock.patch(
         get_func_qual_name(shellingham.detect_shell), return_value=(shell, shell)
-    ), mock.patch.dict(os.environ, patched_os_environment, clear=True):
+    ):
         # ACT: run & force a new version that will trigger the build command
         cli_cmd = [MAIN_PROG_NAME, VERSION_SUBCMD, *cli_args]
-        result = cli_runner.invoke(main, cli_cmd[1:])
+        result = run_cli(cli_cmd[1:], env=patched_os_environment)
 
         # Evaluate
         assert_successful_exit_code(result, cli_cmd)
@@ -108,6 +110,7 @@ def test_version_runs_build_command(
             check=True,
             env={
                 "NEW_VERSION": next_release_version,  # injected into environment
+                "PACKAGE_NAME": "",  # PSR injected environment variable
                 "CI": patched_os_environment["CI"],
                 "BITBUCKET_CI": "true",  # Converted
                 "GITHUB_ACTIONS": patched_os_environment["GITHUB_ACTIONS"],
@@ -123,6 +126,9 @@ def test_version_runs_build_command(
         )
 
         assert built_wheel_file.exists()
+        assert (
+            mocked_git_fetch.call_count == 1
+        )  # fetch called to check for remote changes
         assert mocked_git_push.call_count == 2
         assert post_mocker.call_count == 1
 
@@ -130,26 +136,28 @@ def test_version_runs_build_command(
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows only")
 @pytest.mark.parametrize("shell", ("powershell", "pwsh", "cmd"))
 @pytest.mark.parametrize(
-    "repo, cli_args, next_release_version",
+    "repo_result, cli_args, next_release_version",
     [
         (
-            lazy_fixture(repo_w_trunk_only_angular_commits.__name__),
+            lazy_fixture(repo_w_trunk_only_conventional_commits.__name__),
             ["--patch"],
             "0.1.2",
         )
     ],
 )
 def test_version_runs_build_command_windows(
-    repo: Repo,
+    repo_result: BuiltRepoResult,
     cli_args: list[str],
     next_release_version: str,
-    cli_runner: CliRunner,
+    run_cli: RunCliFn,
     shell: str,
     get_wheel_file: GetWheelFileFn,
     example_pyproject_toml: Path,
     update_pyproject_toml: UpdatePyprojectTomlFn,
+    mocked_git_fetch: mock.MagicMock,
     mocked_git_push: mock.MagicMock,
     post_mocker: mock.Mock,
+    clean_os_environment: dict[str, str],
 ):
     if shell == "cmd":
         build_result_file = get_wheel_file("%NEW_VERSION%")
@@ -166,13 +174,17 @@ def test_version_runs_build_command_windows(
         )
 
     # Setup
+    package_name = "my-package"
+    update_pyproject_toml("project.name", package_name)
     built_wheel_file = get_wheel_file(next_release_version)
-    pyproject_config = tomlkit.loads(example_pyproject_toml.read_text(encoding="utf-8"))
-    build_command = pyproject_config["tool"]["semantic_release"]["build_command"]  # type: ignore[attr-defined]
+    pyproject_config = FlatDict(
+        tomlkit.loads(example_pyproject_toml.read_text(encoding="utf-8")),
+        delimiter=".",
+    )
+    build_command = pyproject_config.get("tool.semantic_release.build_command", "")
     patched_os_environment = {
+        **clean_os_environment,
         "CI": "true",
-        "PATH": os.getenv("PATH", ""),
-        "HOME": "/home/username",
         "VIRTUAL_ENV": "./.venv",
         # Simulate that all CI's are set
         "GITHUB_ACTIONS": "true",
@@ -180,29 +192,6 @@ def test_version_runs_build_command_windows(
         "GITEA_ACTIONS": "true",
         "BITBUCKET_REPO_FULL_NAME": "python-semantic-release/python-semantic-release.git",
         "PSR_DOCKER_GITHUB_ACTION": "true",
-        # Windows
-        "ALLUSERSAPPDATA": "C:\\ProgramData",
-        "ALLUSERSPROFILE": "C:\\ProgramData",
-        "APPDATA": "C:\\Users\\Username\\AppData\\Roaming",
-        "COMMONPROGRAMFILES": "C:\\Program Files\\Common Files",
-        "COMMONPROGRAMFILES(X86)": "C:\\Program Files (x86)\\Common Files",
-        "DEFAULTUSERPROFILE": "C:\\Users\\Default",
-        "HOMEPATH": "\\Users\\Username",
-        "PATHEXT": ".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC",
-        "PROFILESFOLDER": "C:\\Users",
-        "PROGRAMFILES": "C:\\Program Files",
-        "PROGRAMFILES(X86)": "C:\\Program Files (x86)",
-        "SYSTEM": "C:\\Windows\\System32",
-        "SYSTEM16": "C:\\Windows\\System16",
-        "SYSTEM32": "C:\\Windows\\System32",
-        "SYSTEMDRIVE": "C:",
-        "SYSTEMROOT": "C:\\Windows",
-        "TEMP": "C:\\Users\\Username\\AppData\\Local\\Temp",
-        "TMP": "C:\\Users\\Username\\AppData\\Local\\Temp",
-        "USERPROFILE": "C:\\Users\\Username",
-        "USERSID": "S-1-5-21-1234567890-123456789-123456789-1234",
-        "USERNAME": "Username",  # must include for python getpass.getuser() on windows
-        "WINDIR": "C:\\Windows",
     }
 
     # Wrap subprocess.run to capture the arguments to the call
@@ -211,10 +200,10 @@ def test_version_runs_build_command_windows(
         wraps=subprocess.run,
     ) as patched_subprocess_run, mock.patch(
         get_func_qual_name(shellingham.detect_shell), return_value=(shell, shell)
-    ), mock.patch.dict(os.environ, patched_os_environment, clear=True):
+    ):
         # ACT: run & force a new version that will trigger the build command
         cli_cmd = [MAIN_PROG_NAME, VERSION_SUBCMD, *cli_args]
-        result = cli_runner.invoke(main, cli_cmd[1:])
+        result = run_cli(cli_cmd[1:], env=patched_os_environment)
 
         # Evaluate
         assert_successful_exit_code(result, cli_cmd)
@@ -222,77 +211,54 @@ def test_version_runs_build_command_windows(
             [shell, "/c" if shell == "cmd" else "-Command", build_command],
             check=True,
             env={
+                **clean_os_environment,
                 "NEW_VERSION": next_release_version,  # injected into environment
+                "PACKAGE_NAME": package_name,  # PSR injected environment variable
                 "CI": patched_os_environment["CI"],
                 "BITBUCKET_CI": "true",  # Converted
                 "GITHUB_ACTIONS": patched_os_environment["GITHUB_ACTIONS"],
                 "GITEA_ACTIONS": patched_os_environment["GITEA_ACTIONS"],
                 "GITLAB_CI": patched_os_environment["GITLAB_CI"],
-                "HOME": patched_os_environment["HOME"],
-                "PATH": patched_os_environment["PATH"],
                 "VIRTUAL_ENV": patched_os_environment["VIRTUAL_ENV"],
                 "PSR_DOCKER_GITHUB_ACTION": patched_os_environment[
                     "PSR_DOCKER_GITHUB_ACTION"
                 ],
-                # Windows
-                "ALLUSERSAPPDATA": patched_os_environment["ALLUSERSAPPDATA"],
-                "ALLUSERSPROFILE": patched_os_environment["ALLUSERSPROFILE"],
-                "APPDATA": patched_os_environment["APPDATA"],
-                "COMMONPROGRAMFILES": patched_os_environment["COMMONPROGRAMFILES"],
-                "COMMONPROGRAMFILES(X86)": patched_os_environment[
-                    "COMMONPROGRAMFILES(X86)"
-                ],
-                "DEFAULTUSERPROFILE": patched_os_environment["DEFAULTUSERPROFILE"],
-                "HOMEPATH": patched_os_environment["HOMEPATH"],
-                "PATHEXT": patched_os_environment["PATHEXT"],
-                "PROFILESFOLDER": patched_os_environment["PROFILESFOLDER"],
-                "PROGRAMFILES": patched_os_environment["PROGRAMFILES"],
-                "PROGRAMFILES(X86)": patched_os_environment["PROGRAMFILES(X86)"],
-                "SYSTEM": patched_os_environment["SYSTEM"],
-                "SYSTEM16": patched_os_environment["SYSTEM16"],
-                "SYSTEM32": patched_os_environment["SYSTEM32"],
-                "SYSTEMDRIVE": patched_os_environment["SYSTEMDRIVE"],
-                "SYSTEMROOT": patched_os_environment["SYSTEMROOT"],
-                "TEMP": patched_os_environment["TEMP"],
-                "TMP": patched_os_environment["TMP"],
-                "USERPROFILE": patched_os_environment["USERPROFILE"],
-                "USERSID": patched_os_environment["USERSID"],
-                "WINDIR": patched_os_environment["WINDIR"],
             },
         )
 
         dist_file_exists = built_wheel_file.exists()
         assert dist_file_exists, f"\n  Expected wheel file to be created at {built_wheel_file}, but it does not exist."
+        assert (
+            mocked_git_fetch.call_count == 1
+        )  # fetch called to check for remote changes
         assert mocked_git_push.call_count == 2
         assert post_mocker.call_count == 1
 
 
 @pytest.mark.parametrize(
-    "repo, cli_args, next_release_version",
+    "repo_result, cli_args, next_release_version",
     [
         (
-            lazy_fixture(repo_w_trunk_only_angular_commits.__name__),
+            lazy_fixture(repo_w_trunk_only_conventional_commits.__name__),
             ["--patch"],
             "0.1.2",
         )
     ],
 )
 def test_version_runs_build_command_w_user_env(
-    repo: Repo,
+    repo_result: BuiltRepoResult,
     cli_args: list[str],
     next_release_version: str,
-    cli_runner: CliRunner,
+    run_cli: RunCliFn,
     example_pyproject_toml: Path,
     update_pyproject_toml: UpdatePyprojectTomlFn,
+    clean_os_environment: dict[str, str],
 ):
     # Setup
     patched_os_environment = {
+        **clean_os_environment,
         "CI": "true",
-        "PATH": os.getenv("PATH", ""),
-        "HOME": "/home/username",
         "VIRTUAL_ENV": "./.venv",
-        # Windows
-        "USERNAME": "Username",  # must include for python getpass.getuser() on windows
         # Simulate that all CI's are set
         "GITHUB_ACTIONS": "true",
         "GITLAB_CI": "true",
@@ -305,8 +271,11 @@ def test_version_runs_build_command_w_user_env(
         "OVERWRITTEN_VAR": "initial",
         "SET_AS_EMPTY_VAR": "not_empty",
     }
-    pyproject_config = tomlkit.loads(example_pyproject_toml.read_text(encoding="utf-8"))
-    build_command = pyproject_config["tool"]["semantic_release"]["build_command"]  # type: ignore[attr-defined]
+    pyproject_config = FlatDict(
+        tomlkit.loads(example_pyproject_toml.read_text(encoding="utf-8")),
+        delimiter=".",
+    )
+    build_command = pyproject_config.get("tool.semantic_release.build_command", "")
     update_pyproject_toml(
         "tool.semantic_release.build_command_env",
         [
@@ -319,6 +288,8 @@ def test_version_runs_build_command_w_user_env(
             "=ignored-invalid-named-var",  # TODO: validation error instead, but currently just ignore
         ],
     )
+    package_name = "my-package"
+    update_pyproject_toml("project.name", package_name)
 
     # Mock out subprocess.run
     with mock.patch(
@@ -327,7 +298,7 @@ def test_version_runs_build_command_w_user_env(
     ) as patched_subprocess_run, mock.patch(
         get_func_qual_name(shellingham.detect_shell),
         return_value=("bash", "/usr/bin/bash"),
-    ), mock.patch.dict(os.environ, patched_os_environment, clear=True):
+    ):
         cli_cmd = [
             MAIN_PROG_NAME,
             VERSION_SUBCMD,
@@ -339,7 +310,7 @@ def test_version_runs_build_command_w_user_env(
         ]
 
         # ACT: run & force a new version that will trigger the build command
-        result = cli_runner.invoke(main, cli_cmd[1:])
+        result = run_cli(cli_cmd[1:], env=patched_os_environment)
 
         # Evaluate
         # [1] Make sure it did not error internally
@@ -350,14 +321,14 @@ def test_version_runs_build_command_w_user_env(
             ["bash", "-c", build_command],
             check=True,
             env={
+                **clean_os_environment,
                 "NEW_VERSION": next_release_version,  # injected into environment
+                "PACKAGE_NAME": package_name,  # PSR injected environment variable
                 "CI": patched_os_environment["CI"],
                 "BITBUCKET_CI": "true",  # Converted
                 "GITHUB_ACTIONS": patched_os_environment["GITHUB_ACTIONS"],
                 "GITEA_ACTIONS": patched_os_environment["GITEA_ACTIONS"],
                 "GITLAB_CI": patched_os_environment["GITLAB_CI"],
-                "HOME": patched_os_environment["HOME"],
-                "PATH": patched_os_environment["PATH"],
                 "VIRTUAL_ENV": patched_os_environment["VIRTUAL_ENV"],
                 "PSR_DOCKER_GITHUB_ACTION": patched_os_environment[
                     "PSR_DOCKER_GITHUB_ACTION"
@@ -372,9 +343,10 @@ def test_version_runs_build_command_w_user_env(
         )
 
 
-@pytest.mark.usefixtures(repo_w_trunk_only_angular_commits.__name__)
+@pytest.mark.usefixtures(repo_w_trunk_only_conventional_commits.__name__)
 def test_version_skips_build_command_with_skip_build(
-    cli_runner: CliRunner,
+    run_cli: RunCliFn,
+    mocked_git_fetch: mock.MagicMock,
     mocked_git_push: mock.MagicMock,
     post_mocker: mock.Mock,
 ):
@@ -385,11 +357,12 @@ def test_version_skips_build_command_with_skip_build(
         return_value=subprocess.CompletedProcess(args=(), returncode=0),
     ) as patched_subprocess_run:
         # Act: force a new version
-        result = cli_runner.invoke(main, cli_cmd[1:])
+        result = run_cli(cli_cmd[1:])
 
     # Evaluate
     assert_successful_exit_code(result, cli_cmd)
     patched_subprocess_run.assert_not_called()
 
+    assert mocked_git_fetch.call_count == 1  # fetch called to check for remote changes
     assert mocked_git_push.call_count == 2
     assert post_mocker.call_count == 1

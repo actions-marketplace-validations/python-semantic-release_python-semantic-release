@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import sys
 from textwrap import dedent
 from typing import TYPE_CHECKING
 from unittest import mock
@@ -13,10 +12,8 @@ from requests import Session
 
 import semantic_release.hvcs.github
 from semantic_release.changelog.context import ChangelogMode
-from semantic_release.cli.commands.main import main
 from semantic_release.cli.config import ChangelogOutputFormat
 from semantic_release.hvcs.github import Github
-from semantic_release.version.version import Version
 
 from tests.const import (
     CHANGELOG_SUBCMD,
@@ -36,28 +33,31 @@ from tests.fixtures.example_project import (
     example_changelog_rst,
 )
 from tests.fixtures.repos import (
-    get_versions_for_trunk_only_repo_w_no_tags,
-    get_versions_for_trunk_only_repo_w_prerelease_tags,
-    get_versions_for_trunk_only_repo_w_tags,
-    repo_w_git_flow_and_release_channels_angular_commits,
-    repo_w_git_flow_and_release_channels_angular_commits_using_tag_format,
-    repo_w_git_flow_and_release_channels_emoji_commits,
-    repo_w_git_flow_and_release_channels_scipy_commits,
-    repo_w_git_flow_angular_commits,
+    repo_w_git_flow_conventional_commits,
     repo_w_git_flow_emoji_commits,
     repo_w_git_flow_scipy_commits,
-    repo_w_github_flow_w_default_release_channel_angular_commits,
+    repo_w_git_flow_w_alpha_prereleases_n_conventional_commits,
+    repo_w_git_flow_w_alpha_prereleases_n_emoji_commits,
+    repo_w_git_flow_w_alpha_prereleases_n_scipy_commits,
+    repo_w_git_flow_w_beta_alpha_rev_prereleases_n_conventional_commits,
+    repo_w_git_flow_w_beta_alpha_rev_prereleases_n_emoji_commits,
+    repo_w_git_flow_w_beta_alpha_rev_prereleases_n_scipy_commits,
+    repo_w_git_flow_w_rc_n_alpha_prereleases_n_conventional_commits,
+    repo_w_git_flow_w_rc_n_alpha_prereleases_n_conventional_commits_using_tag_format,
+    repo_w_git_flow_w_rc_n_alpha_prereleases_n_emoji_commits,
+    repo_w_git_flow_w_rc_n_alpha_prereleases_n_scipy_commits,
+    repo_w_github_flow_w_default_release_channel_conventional_commits,
     repo_w_github_flow_w_default_release_channel_emoji_commits,
     repo_w_github_flow_w_default_release_channel_scipy_commits,
-    repo_w_github_flow_w_feature_release_channel_angular_commits,
+    repo_w_github_flow_w_feature_release_channel_conventional_commits,
     repo_w_github_flow_w_feature_release_channel_emoji_commits,
     repo_w_github_flow_w_feature_release_channel_scipy_commits,
-    repo_w_no_tags_angular_commits,
+    repo_w_no_tags_conventional_commits,
     repo_w_no_tags_emoji_commits,
     repo_w_no_tags_scipy_commits,
-    repo_w_trunk_only_angular_commits,
+    repo_w_trunk_only_conventional_commits,
     repo_w_trunk_only_emoji_commits,
-    repo_w_trunk_only_n_prereleases_angular_commits,
+    repo_w_trunk_only_n_prereleases_conventional_commits,
     repo_w_trunk_only_n_prereleases_emoji_commits,
     repo_w_trunk_only_n_prereleases_scipy_commits,
     repo_w_trunk_only_scipy_commits,
@@ -72,11 +72,17 @@ from tests.util import (
 
 if TYPE_CHECKING:
     from pathlib import Path
+    from typing import TypedDict
 
-    from click.testing import CliRunner
-    from git import Repo
     from requests_mock import Mocker
 
+    from semantic_release.commit_parser.conventional.parser import (
+        ConventionalCommitParser,
+    )
+    from semantic_release.commit_parser.emoji import EmojiCommitParser
+    from semantic_release.commit_parser.scipy import ScipyCommitParser
+
+    from tests.conftest import RunCliFn
     from tests.e2e.conftest import RetrieveRuntimeContextFn
     from tests.fixtures.example_project import (
         ExProjectDir,
@@ -84,43 +90,50 @@ if TYPE_CHECKING:
         UseReleaseNotesTemplateFn,
     )
     from tests.fixtures.git_repo import (
-        BuildRepoFn,
+        BuildRepoFromDefinitionFn,
+        BuiltRepoResult,
+        CommitConvention,
+        CommitDef,
         CommitNReturnChangelogEntryFn,
         GetCommitDefFn,
-        GetVersionStringsFn,
+        GetRepoDefinitionFn,
+        GetVersionsFromRepoBuildDefFn,
     )
+
+    class Commit2Section(TypedDict):
+        conventional: Commit2SectionCommit
+        emoji: Commit2SectionCommit
+        scipy: Commit2SectionCommit
+
+    class Commit2SectionCommit(TypedDict):
+        commit: CommitDef
+        section: str
 
 
 @pytest.mark.parametrize("arg0", [None, "--post-to-release-tag"])
 @pytest.mark.parametrize(
-    "repo, get_version_strings_fn",
+    "repo_result",
     [
-        (
-            lazy_fixture(repo_fixture),
-            lazy_fixture(get_versions_fn),
-        )
-        for repo_fixture, get_versions_fn in (
+        lazy_fixture(repo_fixture)
+        for repo_fixture in (
             # Only need to test when it has tags or no tags
             # DO NOT need to consider all repo types as it doesn't change no-op behavior
-            (
-                repo_w_no_tags_angular_commits.__name__,
-                get_versions_for_trunk_only_repo_w_no_tags.__name__,
-            ),
-            (
-                repo_w_trunk_only_angular_commits.__name__,
-                get_versions_for_trunk_only_repo_w_tags.__name__,
-            ),
+            repo_w_no_tags_conventional_commits.__name__,
+            repo_w_trunk_only_conventional_commits.__name__,
         )
     ],
 )
 def test_changelog_noop_is_noop(
-    repo: Repo,
-    get_version_strings_fn: GetVersionStringsFn,
+    repo_result: BuiltRepoResult,
     arg0: str | None,
-    cli_runner: CliRunner,
+    run_cli: RunCliFn,
+    get_versions_from_repo_build_def: GetVersionsFromRepoBuildDefFn,
 ):
-    if (version_str := get_version_strings_fn()[-1]) == "Unreleased":
-        version_str = None
+    repo = repo_result["repo"]
+    repo_def = repo_result["definition"]
+    released_versions = get_versions_from_repo_build_def(repo_def)
+
+    version_str = released_versions[-1] if len(released_versions) > 0 else None
 
     repo.git.reset("--hard")
 
@@ -142,7 +155,7 @@ def test_changelog_noop_is_noop(
     ), requests_mock.Mocker(session=session) as mocker:
         args = [arg0, f"v{version_str}"] if version_str and arg0 else []
         cli_cmd = [MAIN_PROG_NAME, "--noop", CHANGELOG_SUBCMD, *args]
-        result = cli_runner.invoke(main, cli_cmd[1:])
+        result = run_cli(cli_cmd[1:])
 
     # Evaluate
     assert_successful_exit_code(result, cli_cmd)
@@ -168,14 +181,14 @@ def test_changelog_noop_is_noop(
     ],
 )
 @pytest.mark.parametrize(
-    "repo",
+    "repo_result",
     [
         *[
             lazy_fixture(repo_fixture)
             for repo_fixture in [
                 # All commit types and one without a release
-                repo_w_no_tags_angular_commits.__name__,
-                repo_w_trunk_only_angular_commits.__name__,
+                repo_w_no_tags_conventional_commits.__name__,
+                repo_w_trunk_only_conventional_commits.__name__,
                 repo_w_trunk_only_emoji_commits.__name__,
                 repo_w_trunk_only_scipy_commits.__name__,
             ]
@@ -183,35 +196,41 @@ def test_changelog_noop_is_noop(
         *[
             pytest.param(lazy_fixture(repo_fixture), marks=pytest.mark.comprehensive)
             for repo_fixture in [
-                # repo_w_no_tags_angular_commits.__name__,
+                # repo_w_no_tags_conventional_commits.__name__,
                 repo_w_no_tags_emoji_commits.__name__,
                 repo_w_no_tags_scipy_commits.__name__,
-                # repo_w_trunk_only_angular_commits.__name__,
+                # repo_w_trunk_only_conventional_commits.__name__,
                 # repo_w_trunk_only_emoji_commits.__name__,
                 # repo_w_trunk_only_scipy_commits.__name__,
-                repo_w_trunk_only_n_prereleases_angular_commits.__name__,
+                repo_w_trunk_only_n_prereleases_conventional_commits.__name__,
                 repo_w_trunk_only_n_prereleases_emoji_commits.__name__,
                 repo_w_trunk_only_n_prereleases_scipy_commits.__name__,
-                repo_w_github_flow_w_default_release_channel_angular_commits.__name__,
+                repo_w_github_flow_w_default_release_channel_conventional_commits.__name__,
                 repo_w_github_flow_w_default_release_channel_emoji_commits.__name__,
                 repo_w_github_flow_w_default_release_channel_scipy_commits.__name__,
-                repo_w_github_flow_w_feature_release_channel_angular_commits.__name__,
+                repo_w_github_flow_w_feature_release_channel_conventional_commits.__name__,
                 repo_w_github_flow_w_feature_release_channel_emoji_commits.__name__,
                 repo_w_github_flow_w_feature_release_channel_scipy_commits.__name__,
-                repo_w_git_flow_angular_commits.__name__,
+                repo_w_git_flow_conventional_commits.__name__,
                 repo_w_git_flow_emoji_commits.__name__,
                 repo_w_git_flow_scipy_commits.__name__,
-                repo_w_git_flow_and_release_channels_angular_commits.__name__,
-                repo_w_git_flow_and_release_channels_emoji_commits.__name__,
-                repo_w_git_flow_and_release_channels_scipy_commits.__name__,
-                repo_w_git_flow_and_release_channels_angular_commits_using_tag_format.__name__,
+                repo_w_git_flow_w_beta_alpha_rev_prereleases_n_conventional_commits.__name__,
+                repo_w_git_flow_w_beta_alpha_rev_prereleases_n_emoji_commits.__name__,
+                repo_w_git_flow_w_beta_alpha_rev_prereleases_n_scipy_commits.__name__,
+                repo_w_git_flow_w_alpha_prereleases_n_conventional_commits.__name__,
+                repo_w_git_flow_w_alpha_prereleases_n_emoji_commits.__name__,
+                repo_w_git_flow_w_alpha_prereleases_n_scipy_commits.__name__,
+                repo_w_git_flow_w_rc_n_alpha_prereleases_n_conventional_commits.__name__,
+                repo_w_git_flow_w_rc_n_alpha_prereleases_n_emoji_commits.__name__,
+                repo_w_git_flow_w_rc_n_alpha_prereleases_n_scipy_commits.__name__,
+                repo_w_git_flow_w_rc_n_alpha_prereleases_n_conventional_commits_using_tag_format.__name__,
             ]
         ],
     ],
 )
 def test_changelog_content_regenerated(
-    repo: Repo,
-    cli_runner: CliRunner,
+    repo_result: BuiltRepoResult,
+    run_cli: RunCliFn,
     update_pyproject_toml: UpdatePyprojectTomlFn,
     changelog_file: Path,
     insertion_flag: str,
@@ -239,7 +258,7 @@ def test_changelog_content_regenerated(
 
     # Act
     cli_cmd = [MAIN_PROG_NAME, CHANGELOG_SUBCMD]
-    result = cli_runner.invoke(main, cli_cmd[1:])
+    result = run_cli(cli_cmd[1:])
 
     # Evaluate
     assert_successful_exit_code(result, cli_cmd)
@@ -270,14 +289,15 @@ def test_changelog_content_regenerated(
 )
 @pytest.mark.usefixtures(change_to_ex_proj_dir.__name__)
 def test_changelog_content_regenerated_masked_initial_release(
-    build_trunk_only_repo_w_tags: BuildRepoFn,
+    build_repo_from_definition: BuildRepoFromDefinitionFn,
+    get_repo_definition_4_trunk_only_repo_w_tags: GetRepoDefinitionFn,
     example_project_dir: ExProjectDir,
-    cli_runner: CliRunner,
+    run_cli: RunCliFn,
     changelog_file: Path,
     insertion_flag: str,
 ):
-    build_trunk_only_repo_w_tags(
-        dest_dir=example_project_dir,
+    build_definition = get_repo_definition_4_trunk_only_repo_w_tags(
+        commit_type="conventional",
         mask_initial_release=True,
         extra_configs={
             "tool.semantic_release.changelog.default_templates.changelog_file": str(
@@ -286,6 +306,7 @@ def test_changelog_content_regenerated_masked_initial_release(
             "tool.semantic_release.changelog.mode": ChangelogMode.INIT.value,
         },
     )
+    build_repo_from_definition(example_project_dir, build_definition)
 
     # Because we are in init mode, the insertion flag is not present in the changelog
     # we must take it out manually because our repo generation fixture includes it automatically
@@ -301,7 +322,7 @@ def test_changelog_content_regenerated_masked_initial_release(
 
     # Act
     cli_cmd = [MAIN_PROG_NAME, CHANGELOG_SUBCMD]
-    result = cli_runner.invoke(main, cli_cmd[1:])
+    result = run_cli(cli_cmd[1:])
 
     # Evaluate
     assert_successful_exit_code(result, cli_cmd)
@@ -323,19 +344,19 @@ def test_changelog_content_regenerated_masked_initial_release(
     ],
 )
 @pytest.mark.parametrize(
-    "repo",
+    "repo_result",
     [
         lazy_fixture(repo_fixture)
         for repo_fixture in [
-            repo_w_trunk_only_angular_commits.__name__,
+            repo_w_trunk_only_conventional_commits.__name__,
             repo_w_trunk_only_emoji_commits.__name__,
             repo_w_trunk_only_scipy_commits.__name__,
         ]
     ],
 )
 def test_changelog_update_mode_unchanged(
-    repo: Repo,
-    cli_runner: CliRunner,
+    repo_result: BuiltRepoResult,
+    run_cli: RunCliFn,
     update_pyproject_toml: UpdatePyprojectTomlFn,
     changelog_file: Path,
 ):
@@ -358,7 +379,7 @@ def test_changelog_update_mode_unchanged(
 
     # Act
     cli_cmd = [MAIN_PROG_NAME, CHANGELOG_SUBCMD]
-    result = cli_runner.invoke(main, cli_cmd[1:])
+    result = run_cli(cli_cmd[1:])
 
     # Evaluate
     assert_successful_exit_code(result, cli_cmd)
@@ -380,22 +401,22 @@ def test_changelog_update_mode_unchanged(
     ],
 )
 @pytest.mark.parametrize(
-    "repo",
+    "repo_result",
     [
         lazy_fixture(repo_fixture)
         for repo_fixture in [
-            repo_w_no_tags_angular_commits.__name__,
+            repo_w_no_tags_conventional_commits.__name__,
             repo_w_no_tags_emoji_commits.__name__,
             repo_w_no_tags_scipy_commits.__name__,
-            repo_w_trunk_only_angular_commits.__name__,
+            repo_w_trunk_only_conventional_commits.__name__,
             repo_w_trunk_only_emoji_commits.__name__,
             repo_w_trunk_only_scipy_commits.__name__,
         ]
     ],
 )
 def test_changelog_update_mode_no_prev_changelog(
-    repo: Repo,
-    cli_runner: CliRunner,
+    repo_result: BuiltRepoResult,
+    run_cli: RunCliFn,
     update_pyproject_toml: UpdatePyprojectTomlFn,
     changelog_file: Path,
 ):
@@ -421,7 +442,7 @@ def test_changelog_update_mode_no_prev_changelog(
 
     # Act
     cli_cmd = [MAIN_PROG_NAME, CHANGELOG_SUBCMD]
-    result = cli_runner.invoke(main, cli_cmd[1:])
+    result = run_cli(cli_cmd[1:])
 
     # Evaluate
     assert_successful_exit_code(result, cli_cmd)
@@ -451,19 +472,19 @@ def test_changelog_update_mode_no_prev_changelog(
     ],
 )
 @pytest.mark.parametrize(
-    "repo",
+    "repo_result",
     [
         lazy_fixture(repo_fixture)
         for repo_fixture in [
-            repo_w_trunk_only_angular_commits.__name__,
+            repo_w_trunk_only_conventional_commits.__name__,
             repo_w_trunk_only_emoji_commits.__name__,
             repo_w_trunk_only_scipy_commits.__name__,
         ]
     ],
 )
 def test_changelog_update_mode_no_flag(
-    repo: Repo,
-    cli_runner: CliRunner,
+    repo_result: BuiltRepoResult,
+    run_cli: RunCliFn,
     update_pyproject_toml: UpdatePyprojectTomlFn,
     changelog_file: Path,
     insertion_flag: str,
@@ -496,7 +517,7 @@ def test_changelog_update_mode_no_flag(
 
     # Act
     cli_cmd = [MAIN_PROG_NAME, CHANGELOG_SUBCMD]
-    result = cli_runner.invoke(main, cli_cmd[1:])
+    result = run_cli(cli_cmd[1:])
 
     # Evaluate
     assert_successful_exit_code(result, cli_cmd)
@@ -524,31 +545,34 @@ def test_changelog_update_mode_no_flag(
     ],
 )
 @pytest.mark.parametrize(
-    "repo",
+    "repo_result",
     [
         lazy_fixture(repo_fixture)
         for repo_fixture in [
             # MUST HAVE at least 2 tags!
-            repo_w_trunk_only_angular_commits.__name__,
+            repo_w_trunk_only_conventional_commits.__name__,
             repo_w_trunk_only_emoji_commits.__name__,
             repo_w_trunk_only_scipy_commits.__name__,
         ]
     ],
 )
 def test_changelog_update_mode_no_header(
-    repo: Repo,
-    cli_runner: CliRunner,
+    repo_result: BuiltRepoResult,
+    run_cli: RunCliFn,
     update_pyproject_toml: UpdatePyprojectTomlFn,
     changelog_format: ChangelogOutputFormat,
     changelog_file: Path,
     default_md_changelog_insertion_flag: str,
     default_rst_changelog_insertion_flag: str,
+    get_versions_from_repo_build_def: GetVersionsFromRepoBuildDefFn,
 ):
     """
     Given a changelog template with the insertion flag at the beginning of the file,
     When the changelog command is run in "update" mode,
     Then the changelog is rebuilt with the latest release prepended to the existing content.
     """
+    repo = repo_result["repo"]
+
     # Mappings of correct fixtures to use based on the changelog format
     insertion_flags = {
         ChangelogOutputFormat.MARKDOWN: (
@@ -587,11 +611,12 @@ def test_changelog_update_mode_no_header(
         expected_changelog_content = rfd.read()
 
     # Reset changelog file to last release
-    repo.git.checkout(repo.tags[-2].name, "--", str(changelog_file.name))
+    previous_tag = f'v{get_versions_from_repo_build_def(repo_result["definition"])[-2]}'
+    repo.git.checkout(previous_tag, "--", str(changelog_file.name))
 
     # Act
     cli_cmd = [MAIN_PROG_NAME, CHANGELOG_SUBCMD]
-    result = cli_runner.invoke(main, cli_cmd[1:])
+    result = run_cli(cli_cmd[1:])
 
     # Evaluate
     assert_successful_exit_code(result, cli_cmd)
@@ -622,32 +647,37 @@ def test_changelog_update_mode_no_header(
     ],
 )
 @pytest.mark.parametrize(
-    "repo",
+    "repo_result",
     [
         lazy_fixture(repo_fixture)
         for repo_fixture in [
             # MUST HAVE at least 2 tags!
-            repo_w_trunk_only_angular_commits.__name__,
+            repo_w_trunk_only_conventional_commits.__name__,
             repo_w_trunk_only_emoji_commits.__name__,
             repo_w_trunk_only_scipy_commits.__name__,
         ]
     ],
 )
 def test_changelog_update_mode_no_footer(
-    repo: Repo,
-    cli_runner: CliRunner,
+    repo_result: BuiltRepoResult,
+    run_cli: RunCliFn,
     update_pyproject_toml: UpdatePyprojectTomlFn,
     changelog_format: ChangelogOutputFormat,
     changelog_file: Path,
     insertion_flag: str,
+    get_versions_from_repo_build_def: GetVersionsFromRepoBuildDefFn,
 ):
     """
     Given a changelog template with the insertion flag at the end of the file,
     When the changelog command is run in "update" mode,
     Then the changelog is rebuilt with only the latest release.
     """
+    repo_result["repo"]
+
     # Mappings of correct fixtures to use based on the changelog format
-    prev_version_tag = repo.tags[-2].name
+    prev_version_tag = (
+        f"v{get_versions_from_repo_build_def(repo_result['definition'])[-2]}"
+    )
     split_flags = {
         ChangelogOutputFormat.MARKDOWN: f"\n\n## {prev_version_tag}",
         ChangelogOutputFormat.RESTRUCTURED_TEXT: f"\n\n.. _changelog-{prev_version_tag}:",
@@ -690,7 +720,7 @@ def test_changelog_update_mode_no_footer(
 
     # Act
     cli_cmd = [MAIN_PROG_NAME, CHANGELOG_SUBCMD]
-    result = cli_runner.invoke(main, cli_cmd[1:])
+    result = run_cli(cli_cmd[1:])
 
     # Evaluate
     assert_successful_exit_code(result, cli_cmd)
@@ -721,20 +751,20 @@ def test_changelog_update_mode_no_footer(
     ],
 )
 @pytest.mark.parametrize(
-    "repo",
+    "repo_result",
     [
         lazy_fixture(repo_fixture)
         for repo_fixture in [
             # Must not have a single release/tag
-            repo_w_no_tags_angular_commits.__name__,
+            repo_w_no_tags_conventional_commits.__name__,
             repo_w_no_tags_emoji_commits.__name__,
             repo_w_no_tags_scipy_commits.__name__,
         ]
     ],
 )
 def test_changelog_update_mode_no_releases(
-    repo: Repo,
-    cli_runner: CliRunner,
+    repo_result: BuiltRepoResult,
+    run_cli: RunCliFn,
     update_pyproject_toml: UpdatePyprojectTomlFn,
     changelog_file: Path,
     insertion_flag: str,
@@ -789,7 +819,7 @@ def test_changelog_update_mode_no_releases(
 
     # Act
     cli_cmd = [MAIN_PROG_NAME, CHANGELOG_SUBCMD]
-    result = cli_runner.invoke(main, cli_cmd[1:])
+    result = run_cli(cli_cmd[1:])
 
     # Evaluate
     assert_successful_exit_code(result, cli_cmd)
@@ -821,36 +851,41 @@ def test_changelog_update_mode_no_releases(
     ],
 )
 @pytest.mark.parametrize(
-    "repo, commit_type",
+    "repo_result, commit_type",
     [
         (lazy_fixture(repo_fixture), repo_fixture.split("_")[-2])
         for repo_fixture in [
-            repo_w_trunk_only_angular_commits.__name__,
+            repo_w_trunk_only_conventional_commits.__name__,
             repo_w_trunk_only_emoji_commits.__name__,
             repo_w_trunk_only_scipy_commits.__name__,
         ]
     ],
 )
 def test_changelog_update_mode_unreleased_n_released(
-    repo: Repo,
-    commit_type: str,
+    repo_result: BuiltRepoResult,
+    commit_type: CommitConvention,
     changelog_format: ChangelogOutputFormat,
-    cli_runner: CliRunner,
+    run_cli: RunCliFn,
     update_pyproject_toml: UpdatePyprojectTomlFn,
     example_git_ssh_url: str,
     file_in_repo: str,
     commit_n_rtn_changelog_entry: CommitNReturnChangelogEntryFn,
     changelog_file: Path,
     insertion_flag: str,
-    get_commit_def_of_angular_commit: GetCommitDefFn,
-    get_commit_def_of_emoji_commit: GetCommitDefFn,
-    get_commit_def_of_scipy_commit: GetCommitDefFn,
+    get_commit_def_of_conventional_commit: GetCommitDefFn[ConventionalCommitParser],
+    get_commit_def_of_emoji_commit: GetCommitDefFn[EmojiCommitParser],
+    get_commit_def_of_scipy_commit: GetCommitDefFn[ScipyCommitParser],
+    default_conventional_parser: ConventionalCommitParser,
+    default_emoji_parser: EmojiCommitParser,
+    default_scipy_parser: ScipyCommitParser,
 ):
     """
     Given there are unreleased changes and a previous release in the changelog,
     When the changelog command is run in "update" mode,
     Then the changelog is only updated with the unreleased changes.
     """
+    repo = repo_result["repo"]
+
     # Set the project configurations
     update_pyproject_toml(
         "tool.semantic_release.changelog.mode", ChangelogMode.UPDATE.value
@@ -860,21 +895,26 @@ def test_changelog_update_mode_unreleased_n_released(
         str(changelog_file.name),
     )
 
-    commit_n_section = {
-        "angular": {
-            "commit": get_commit_def_of_angular_commit(
-                "perf: improve the performance of the application"
+    commit_n_section: Commit2Section = {
+        "conventional": {
+            "commit": get_commit_def_of_conventional_commit(
+                "perf: improve the performance of the application",
+                parser=default_conventional_parser,
             ),
             "section": "Performance Improvements",
         },
         "emoji": {
             "commit": get_commit_def_of_emoji_commit(
-                ":zap: improve the performance of the application"
+                ":zap: improve the performance of the application",
+                parser=default_emoji_parser,
             ),
             "section": ":zap:",
         },
         "scipy": {
-            "commit": get_commit_def_of_scipy_commit("MAINT: fix an issue"),
+            "commit": get_commit_def_of_scipy_commit(
+                "MAINT: fix an issue",
+                parser=default_scipy_parser,
+            ),
             "section": "Fix",
         },
     }
@@ -904,7 +944,10 @@ def test_changelog_update_mode_unreleased_n_released(
         repo,
         commit_n_section[commit_type]["commit"],
     )
-    hvcs = Github(example_git_ssh_url, hvcs_domain=EXAMPLE_HVCS_DOMAIN)
+
+    with mock.patch.dict(os.environ, {}, clear=True):
+        hvcs = Github(example_git_ssh_url, hvcs_domain=EXAMPLE_HVCS_DOMAIN)
+        assert hvcs.repo_name  # force caching of repo values (ignoring the env)
 
     unreleased_change_variants = {
         ChangelogOutputFormat.MARKDOWN: dedent(
@@ -963,7 +1006,7 @@ def test_changelog_update_mode_unreleased_n_released(
 
     # Act
     cli_cmd = [MAIN_PROG_NAME, CHANGELOG_SUBCMD]
-    result = cli_runner.invoke(main, cli_cmd[1:])
+    result = run_cli(cli_cmd[1:])
 
     # Evaluate
     assert_successful_exit_code(result, cli_cmd)
@@ -980,26 +1023,33 @@ def test_changelog_update_mode_unreleased_n_released(
 
 
 # Just need to test that it works for "a" project, not all
-@pytest.mark.usefixtures(repo_w_trunk_only_n_prereleases_angular_commits.__name__)
+@pytest.mark.usefixtures(repo_w_trunk_only_n_prereleases_conventional_commits.__name__)
 @pytest.mark.parametrize(
     "args", [("--post-to-release-tag", "v1.99.91910000000000000000000000000")]
 )
 def test_changelog_release_tag_not_in_history(
     args: list[str],
-    cli_runner: CliRunner,
+    run_cli: RunCliFn,
 ):
     # Act
     cli_cmd = [MAIN_PROG_NAME, CHANGELOG_SUBCMD, *args]
-    result = cli_runner.invoke(main, cli_cmd[1:])
+    result = run_cli(cli_cmd[1:])
 
     # Evaluate
     assert_exit_code(2, result, cli_cmd)
     assert "not in release history" in result.stderr.lower()
 
 
-@pytest.mark.usefixtures(repo_w_trunk_only_n_prereleases_angular_commits.__name__)
-@pytest.mark.parametrize("args", [("--post-to-release-tag", "v0.1.0")])
-def test_changelog_post_to_release(args: list[str], cli_runner: CliRunner):
+@pytest.mark.usefixtures(repo_w_trunk_only_n_prereleases_conventional_commits.__name__)
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("--post-to-release-tag", "v0.1.0"),  #      first release
+        ("--post-to-release-tag", "v0.1.1-rc.1"),  # second release
+        ("--post-to-release-tag", "v0.2.0"),  #      latest release
+    ],
+)
+def test_changelog_post_to_release(args: list[str], run_cli: RunCliFn):
     # Set up a requests HTTP session so we can catch the HTTP calls and ensure they're
     # made
 
@@ -1019,59 +1069,22 @@ def test_changelog_post_to_release(args: list[str], cli_runner: CliRunner):
         repo_name=EXAMPLE_REPO_NAME,
     )
 
-    clean_os_environment = dict(
-        filter(
-            lambda k_v: k_v[1] is not None,
-            {
-                "CI": "true",
-                "PATH": os.getenv("PATH"),
-                "HOME": os.getenv("HOME"),
-                "VIRTUAL_ENV": os.getenv("VIRTUAL_ENV", "./.venv"),
-                **(
-                    {}
-                    if sys.platform != "win32"
-                    else {
-                        # Windows Required variables
-                        "ALLUSERSAPPDATA": os.getenv("ALLUSERSAPPDATA"),
-                        "ALLUSERSPROFILE": os.getenv("ALLUSERSPROFILE"),
-                        "APPDATA": os.getenv("APPDATA"),
-                        "COMMONPROGRAMFILES": os.getenv("COMMONPROGRAMFILES"),
-                        "COMMONPROGRAMFILES(X86)": os.getenv("COMMONPROGRAMFILES(X86)"),
-                        "DEFAULTUSERPROFILE": os.getenv("DEFAULTUSERPROFILE"),
-                        "HOMEPATH": os.getenv("HOMEPATH"),
-                        "PATHEXT": os.getenv("PATHEXT"),
-                        "PROFILESFOLDER": os.getenv("PROFILESFOLDER"),
-                        "PROGRAMFILES": os.getenv("PROGRAMFILES"),
-                        "PROGRAMFILES(X86)": os.getenv("PROGRAMFILES(X86)"),
-                        "SYSTEM": os.getenv("SYSTEM"),
-                        "SYSTEM16": os.getenv("SYSTEM16"),
-                        "SYSTEM32": os.getenv("SYSTEM32"),
-                        "SYSTEMDRIVE": os.getenv("SYSTEMDRIVE"),
-                        "SYSTEMROOT": os.getenv("SYSTEMROOT"),
-                        "TEMP": os.getenv("TEMP"),
-                        "TMP": os.getenv("TMP"),
-                        "USERPROFILE": os.getenv("USERPROFILE"),
-                        "USERSID": os.getenv("USERSID"),
-                        "USERNAME": os.getenv("USERNAME"),
-                        "WINDIR": os.getenv("WINDIR"),
-                    }
-                ),
-            }.items(),
-        )
-    )
-
     # Patch out env vars that affect changelog URLs but only get set in e.g.
     # Github actions
     with mock.patch(
         # Patching the specific module's reference to the build_requests_session function
         f"{semantic_release.hvcs.github.__name__}.{semantic_release.hvcs.github.build_requests_session.__name__}",
         return_value=session,
-    ) as build_requests_session_mock, mock.patch.dict(
-        os.environ, clean_os_environment, clear=True
-    ):
+    ) as build_requests_session_mock:
         # Act
         cli_cmd = [MAIN_PROG_NAME, CHANGELOG_SUBCMD, *args]
-        result = cli_runner.invoke(main, cli_cmd[1:])
+        result = run_cli(
+            cli_cmd[1:],
+            env={
+                "CI": "true",
+                "VIRTUAL_ENV": os.getenv("VIRTUAL_ENV", "./.venv"),
+            },
+        )
 
     # Evaluate
     assert_successful_exit_code(result, cli_cmd)
@@ -1082,29 +1095,24 @@ def test_changelog_post_to_release(args: list[str], cli_runner: CliRunner):
 
 
 @pytest.mark.parametrize(
-    "repo, get_version_strings",
-    [
-        (
-            lazy_fixture(repo_w_trunk_only_n_prereleases_angular_commits.__name__),
-            lazy_fixture(get_versions_for_trunk_only_repo_w_prerelease_tags.__name__),
-        ),
-    ],
+    "repo_result",
+    [lazy_fixture(repo_w_trunk_only_n_prereleases_conventional_commits.__name__)],
 )
 def test_custom_release_notes_template(
-    repo: Repo,
-    get_version_strings: GetVersionStringsFn,
+    repo_result: BuiltRepoResult,
+    get_versions_from_repo_build_def: GetVersionsFromRepoBuildDefFn,
     use_release_notes_template: UseReleaseNotesTemplateFn,
     retrieve_runtime_context: RetrieveRuntimeContextFn,
     post_mocker: Mocker,
-    cli_runner: CliRunner,
+    run_cli: RunCliFn,
 ) -> None:
     """Verify the template `.release_notes.md.j2` from `template_dir` is used."""
     expected_call_count = 1
-    version = Version.parse(get_version_strings()[-1])
+    version = get_versions_from_repo_build_def(repo_result["definition"])[-1]
 
     # Setup
     use_release_notes_template()
-    runtime_context = retrieve_runtime_context(repo)
+    runtime_context = retrieve_runtime_context(repo_result["repo"])
     release_history = get_release_history_from_context(runtime_context)
     release = release_history.released[version]
     tag = runtime_context.version_translator.str_to_tag(str(version))
@@ -1124,7 +1132,7 @@ def test_custom_release_notes_template(
 
     # Act
     cli_cmd = [MAIN_PROG_NAME, CHANGELOG_SUBCMD, "--post-to-release-tag", tag]
-    result = cli_runner.invoke(main, cli_cmd[1:])
+    result = run_cli(cli_cmd[1:])
 
     # Assert
     assert_successful_exit_code(result, cli_cmd)
@@ -1135,13 +1143,13 @@ def test_custom_release_notes_template(
     assert expected_release_notes == actual_notes
 
 
-@pytest.mark.usefixtures(repo_w_trunk_only_angular_commits.__name__)
+@pytest.mark.usefixtures(repo_w_trunk_only_conventional_commits.__name__)
 def test_changelog_default_on_empty_template_dir(
     example_changelog_md: Path,
     changelog_template_dir: Path,
     example_project_template_dir: Path,
     update_pyproject_toml: UpdatePyprojectTomlFn,
-    cli_runner: CliRunner,
+    run_cli: RunCliFn,
 ):
     # Setup: Make sure default changelog doesn't already exist
     example_changelog_md.unlink(missing_ok=True)
@@ -1157,7 +1165,7 @@ def test_changelog_default_on_empty_template_dir(
 
     # Act
     cli_cmd = [MAIN_PROG_NAME, CHANGELOG_SUBCMD]
-    result = cli_runner.invoke(main, cli_cmd[1:])
+    result = run_cli(cli_cmd[1:])
 
     # Evaluate
     assert_successful_exit_code(result, cli_cmd)
@@ -1166,13 +1174,13 @@ def test_changelog_default_on_empty_template_dir(
     assert example_changelog_md.exists()
 
 
-@pytest.mark.usefixtures(repo_w_trunk_only_angular_commits.__name__)
+@pytest.mark.usefixtures(repo_w_trunk_only_conventional_commits.__name__)
 def test_changelog_default_on_incorrect_config_template_file(
     example_changelog_md: Path,
     changelog_template_dir: Path,
     example_project_template_dir: Path,
     update_pyproject_toml: UpdatePyprojectTomlFn,
-    cli_runner: CliRunner,
+    run_cli: RunCliFn,
 ):
     # Setup: Make sure default changelog doesn't already exist
     example_changelog_md.unlink(missing_ok=True)
@@ -1189,7 +1197,7 @@ def test_changelog_default_on_incorrect_config_template_file(
 
     # Act
     cli_cmd = [MAIN_PROG_NAME, CHANGELOG_SUBCMD]
-    result = cli_runner.invoke(main, cli_cmd[1:])
+    result = run_cli(cli_cmd[1:])
 
     # Evaluate
     assert_successful_exit_code(result, cli_cmd)
@@ -1199,11 +1207,11 @@ def test_changelog_default_on_incorrect_config_template_file(
 
 
 @pytest.mark.parametrize("bad_changelog_file_str", ("/etc/passwd", "../../.ssh/id_rsa"))
-@pytest.mark.usefixtures(repo_w_trunk_only_angular_commits.__name__)
+@pytest.mark.usefixtures(repo_w_trunk_only_conventional_commits.__name__)
 def test_changelog_prevent_malicious_path_traversal_file(
     update_pyproject_toml: UpdatePyprojectTomlFn,
     bad_changelog_file_str: str,
-    cli_runner: CliRunner,
+    run_cli: RunCliFn,
 ):
     # Setup: A malicious path traversal filepath outside of the repository
     update_pyproject_toml(
@@ -1213,7 +1221,7 @@ def test_changelog_prevent_malicious_path_traversal_file(
 
     # Act
     cli_cmd = [MAIN_PROG_NAME, "--noop", CHANGELOG_SUBCMD]
-    result = cli_runner.invoke(main, cli_cmd[1:])
+    result = run_cli(cli_cmd[1:])
 
     # Evaluate
     assert_exit_code(1, result, cli_cmd)
@@ -1224,11 +1232,11 @@ def test_changelog_prevent_malicious_path_traversal_file(
 
 
 @pytest.mark.parametrize("template_dir_path", ("~/.ssh", "../../.ssh"))
-@pytest.mark.usefixtures(repo_w_trunk_only_angular_commits.__name__)
+@pytest.mark.usefixtures(repo_w_trunk_only_conventional_commits.__name__)
 def test_changelog_prevent_external_path_traversal_dir(
     update_pyproject_toml: UpdatePyprojectTomlFn,
     template_dir_path: str,
-    cli_runner: CliRunner,
+    run_cli: RunCliFn,
 ):
     # Setup: A malicious path traversal filepath outside of the repository
     update_pyproject_toml(
@@ -1238,7 +1246,7 @@ def test_changelog_prevent_external_path_traversal_dir(
 
     # Act
     cli_cmd = [MAIN_PROG_NAME, "--noop", CHANGELOG_SUBCMD]
-    result = cli_runner.invoke(main, cli_cmd[1:])
+    result = run_cli(cli_cmd[1:])
 
     # Evaluate
     assert_exit_code(1, result, cli_cmd)

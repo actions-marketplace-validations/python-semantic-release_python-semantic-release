@@ -1,13 +1,103 @@
-import importlib
-import logging
+from __future__ import annotations
+
+import importlib.util
+import os
 import re
 import string
-from functools import lru_cache, wraps
-from pathlib import PurePosixPath
-from typing import Any, Callable, NamedTuple, TypeVar
+import sys
+from functools import lru_cache, reduce, wraps
+from pathlib import Path, PurePosixPath
+from re import IGNORECASE, compile as regexp
+from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Sequence, TypeVar
 from urllib.parse import urlsplit
 
-log = logging.getLogger(__name__)
+from semantic_release.globals import logger
+
+if TYPE_CHECKING:  # pragma: no cover
+    from logging import Logger
+    from re import Pattern
+    from typing import Iterable
+
+
+number_pattern = regexp(r"(?P<prefix>\S*?)(?P<number>\d[\d,]*)\b")
+hex_number_pattern = regexp(
+    r"(?P<prefix>\S*?)(?:0x)?(?P<number>[0-9a-f]+)\b", IGNORECASE
+)
+
+
+def get_number_from_str(
+    string: str, default: int = -1, interpret_hex: bool = False
+) -> int:
+    if interpret_hex and (match := hex_number_pattern.search(string)):
+        return abs(int(match.group("number"), 16))
+
+    if match := number_pattern.search(string):
+        return int(match.group("number"))
+
+    return default
+
+
+def sort_numerically(
+    iterable: Iterable[str], reverse: bool = False, allow_hex: bool = False
+) -> list[str]:
+    # Alphabetically sort prefixes first, then sort by number
+    alphabetized_list = sorted(iterable)
+
+    # Extract prefixes in order to group items by prefix
+    unmatched_items = []
+    prefixes: dict[str, list[str]] = {}
+    for item in alphabetized_list:
+        if not (
+            pattern_match := (
+                (hex_number_pattern.search(item) if allow_hex else None)
+                or number_pattern.search(item)
+            )
+        ):
+            unmatched_items.append(item)
+            continue
+
+        prefix = prefix if (prefix := pattern_match.group("prefix")) else ""
+
+        if prefix not in prefixes:
+            prefixes[prefix] = []
+
+        prefixes[prefix].append(item)
+
+    # Sort prefixes and items by number mixing in unmatched items as alphabetized with other prefixes
+    return reduce(
+        lambda acc, next_item: acc + next_item,
+        [
+            (
+                sorted(
+                    prefixes[prefix],
+                    key=lambda x: get_number_from_str(
+                        x, default=-1, interpret_hex=allow_hex
+                    ),
+                    reverse=reverse,
+                )
+                if prefix in prefixes
+                else [prefix]
+            )
+            for prefix in sorted([*prefixes.keys(), *unmatched_items])
+        ],
+        [],
+    )
+
+
+def text_reducer(text: str, filter_pair: tuple[Pattern[str], str]) -> str:
+    """Reduce function to apply mulitple filters to a string"""
+    if not text:  # abort if the paragraph is empty
+        return text
+
+    filter_pattern, replacement = filter_pair
+    return filter_pattern.sub(replacement, text)
+
+
+def validate_types_in_sequence(
+    sequence: Sequence, types: type | tuple[type, ...]
+) -> bool:
+    """Validate that all elements in a sequence are of a specific type"""
+    return all(isinstance(item, types) for item in sequence)
 
 
 def format_arg(value: Any) -> str:
@@ -28,7 +118,7 @@ _R = TypeVar("_R")
 _FuncType = Callable[..., _R]
 
 
-def logged_function(logger: logging.Logger) -> Callable[[_FuncType[_R]], _FuncType[_R]]:
+def logged_function(logger: Logger) -> Callable[[_FuncType[_R]], _FuncType[_R]]:
     """
     Decorator which adds debug logging of a function's input arguments and return
     value.
@@ -61,16 +151,59 @@ def logged_function(logger: logging.Logger) -> Callable[[_FuncType[_R]], _FuncTy
     return _logged_function
 
 
-@logged_function(log)
+@logged_function(logger)
 def dynamic_import(import_path: str) -> Any:
     """
     Dynamically import an object from a conventionally formatted "module:attribute"
     string
     """
-    log.debug("Trying to import %s", import_path)
+    if ":" not in import_path:
+        raise ValueError(
+            f"Invalid import path {import_path!r}, must use 'module:Class' format"
+        )
+
+    # Split the import path into module and attribute
     module_name, attr = import_path.split(":", maxsplit=1)
-    module = importlib.import_module(module_name)
-    return getattr(module, attr)
+
+    # Check if the module is a file path, if it can be resolved and exists on disk then import as a file
+    module_filepath = Path(module_name).resolve()
+    if module_filepath.exists():
+        module_path = (
+            module_filepath.stem
+            if Path(module_name).is_absolute()
+            else str(Path(module_name).with_suffix("")).replace(os.sep, ".").lstrip(".")
+        )
+
+        if module_path not in sys.modules:
+            logger.debug("Loading '%s' from file '%s'", module_path, module_filepath)
+            spec = importlib.util.spec_from_file_location(
+                module_path, str(module_filepath)
+            )
+            if spec is None:
+                raise ImportError(f"Could not import {module_filepath}")
+
+            module = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+            sys.modules.update({spec.name: module})
+            spec.loader.exec_module(module)  # type: ignore[union-attr]
+
+        return getattr(sys.modules[module_path], attr)
+
+    # Otherwise, import as a module
+    try:
+        logger.debug("Importing module '%s'", module_name)
+        module = importlib.import_module(module_name)
+        logger.debug("Loading '%s' from module '%s'", attr, module_name)
+        return getattr(module, attr)
+    except TypeError as err:
+        raise ImportError(
+            str.join(
+                "\n",
+                [
+                    str(err.args[0]),
+                    "Verify the import format matches 'module:attribute' or 'path/to/module:attribute'",
+                ],
+            )
+        ) from err
 
 
 class ParsedGitUrl(NamedTuple):
@@ -109,7 +242,7 @@ def parse_git_url(url: str) -> ParsedGitUrl:
 
     Raises ValueError if the url can't be parsed.
     """
-    log.debug("Parsing git url %r", url)
+    logger.debug("Parsing git url %r", url)
 
     # Normalizers are a list of tuples of (pattern, replacement)
     normalizers = [

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-import logging
+from contextlib import suppress
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import click
-from git import Repo
+import tomlkit
+from git import GitCommandError, Repo
 
 from semantic_release.changelog.release_history import ReleaseHistory
 from semantic_release.cli.changelog_writer import (
@@ -12,13 +14,48 @@ from semantic_release.cli.changelog_writer import (
     write_changelog_files,
 )
 from semantic_release.cli.util import noop_report
+from semantic_release.globals import logger
 from semantic_release.hvcs.remote_hvcs_base import RemoteHvcsBase
 
 if TYPE_CHECKING:  # pragma: no cover
     from semantic_release.cli.cli_context import CliContextObj
 
 
-log = logging.getLogger(__name__)
+def get_license_name_for_release(tag_name: str, project_root: Path) -> str:
+    # Retrieve the license name at the time of the specific release tag
+    project_metadata: dict[str, str] = {}
+    curr_dir = Path.cwd().resolve()
+    allowed_directories = [
+        dir_path
+        for dir_path in [curr_dir, *curr_dir.parents]
+        if str(project_root) in str(dir_path)
+    ]
+    for allowed_dir in allowed_directories:
+        proj_toml = allowed_dir.joinpath("pyproject.toml")
+        with Repo(project_root) as git_repo, suppress(GitCommandError):
+            toml_contents = git_repo.git.show(
+                f"{tag_name}:{proj_toml.relative_to(project_root)}"
+            )
+            config_toml = tomlkit.parse(toml_contents)
+            project_metadata = config_toml.unwrap().get("project", project_metadata)
+            break
+
+    license_cfg = project_metadata.get(
+        "license-expression",
+        project_metadata.get(
+            "license",
+            "",
+        ),
+    )
+
+    if not isinstance(license_cfg, (str, dict)) or license_cfg is None:
+        return ""
+
+    return (
+        license_cfg.get("text", "")  # type: ignore[attr-defined]
+        if isinstance(license_cfg, dict)
+        else license_cfg or ""
+    )
 
 
 def post_release_notes(
@@ -120,6 +157,10 @@ def changelog(cli_ctx: CliContextObj, release_tag: str | None) -> None:
         release_history,
         style=runtime.changelog_style,
         mask_initial_release=runtime.changelog_mask_initial_release,
+        license_name=get_license_name_for_release(
+            tag_name=release_tag,
+            project_root=runtime.repo_dir,
+        ),
     )
 
     try:
@@ -130,7 +171,7 @@ def changelog(cli_ctx: CliContextObj, release_tag: str | None) -> None:
             hvcs_client=hvcs_client,
             noop=runtime.global_cli_options.noop,
         )
-    except Exception as e:
-        log.exception(e)
+    except Exception as e:  # noqa: BLE001 # TODO: catch specific exceptions
+        logger.exception(e)
         click.echo("Failed to post release notes to remote", err=True)
         ctx.exit(1)

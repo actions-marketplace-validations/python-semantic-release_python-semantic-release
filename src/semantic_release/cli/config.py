@@ -2,13 +2,21 @@ from __future__ import annotations
 
 import logging
 import os
-import re
 from collections.abc import Mapping
 from dataclasses import dataclass, is_dataclass
 from enum import Enum
+from functools import reduce
 from pathlib import Path
+from re import (
+    Pattern,
+    compile as regexp,
+    error as RegExpError,  # noqa: N812
+    escape as regex_escape,
+)
 from typing import Any, ClassVar, Dict, List, Literal, Optional, Tuple, Type, Union
 
+# typing_extensions is for Python 3.8, 3.9, 3.10 compatibility
+import tomlkit
 from git import Actor, InvalidGitRepositoryError
 from git.repo.base import Repo
 from jinja2 import Environment
@@ -20,8 +28,6 @@ from pydantic import (
     field_validator,
     model_validator,
 )
-
-# typing_extensions is for Python 3.8, 3.9, 3.10 compatibility
 from typing_extensions import Annotated, Self
 from urllib3.util.url import parse_url
 
@@ -33,13 +39,15 @@ from semantic_release.cli.masking_filter import MaskingFilter
 from semantic_release.commit_parser import (
     AngularCommitParser,
     CommitParser,
+    ConventionalCommitMonorepoParser,
+    ConventionalCommitParser,
     EmojiCommitParser,
     ParseResult,
     ParserOptions,
     ScipyCommitParser,
     TagCommitParser,
 )
-from semantic_release.const import COMMIT_MESSAGE, DEFAULT_COMMIT_AUTHOR, SEMVER_REGEX
+from semantic_release.const import COMMIT_MESSAGE, DEFAULT_COMMIT_AUTHOR
 from semantic_release.errors import (
     DetachedHeadGitError,
     InvalidConfiguration,
@@ -47,16 +55,13 @@ from semantic_release.errors import (
     NotAReleaseBranch,
     ParserLoadError,
 )
+from semantic_release.globals import logger
 from semantic_release.helpers import dynamic_import
-from semantic_release.hvcs.remote_hvcs_base import RemoteHvcsBase
-from semantic_release.version.declaration import (
-    PatternVersionDeclaration,
-    TomlVersionDeclaration,
-    VersionDeclarationABC,
-)
+from semantic_release.version.declarations.i_version_replacer import IVersionReplacer
+from semantic_release.version.declarations.pattern import PatternVersionDeclaration
+from semantic_release.version.declarations.toml import TomlVersionDeclaration
 from semantic_release.version.translator import VersionTranslator
 
-log = logging.getLogger(__name__)
 NonEmptyString = Annotated[str, Field(..., min_length=1)]
 
 
@@ -67,8 +72,10 @@ class HvcsClient(str, Enum):
     GITEA = "gitea"
 
 
-_known_commit_parsers: Dict[str, type[CommitParser]] = {
+_known_commit_parsers: dict[str, type[CommitParser[Any, Any]]] = {
     "angular": AngularCommitParser,
+    "conventional": ConventionalCommitParser,
+    "conventional-monorepo": ConventionalCommitMonorepoParser,
     "emoji": EmojiCommitParser,
     "scipy": ScipyCommitParser,
     "tag": TagCommitParser,
@@ -123,8 +130,7 @@ class ChangelogEnvironmentConfig(BaseModel):
 class DefaultChangelogTemplatesConfig(BaseModel):
     changelog_file: str = "CHANGELOG.md"
     output_format: ChangelogOutputFormat = ChangelogOutputFormat.NONE
-    # TODO: Breaking Change v10, it will become True
-    mask_initial_release: bool = False
+    mask_initial_release: bool = True
 
     @model_validator(mode="after")
     def interpret_output_format(self) -> Self:
@@ -144,7 +150,7 @@ class DefaultChangelogTemplatesConfig(BaseModel):
 
 
 class ChangelogConfig(BaseModel):
-    # TODO: BREAKING CHANGE v10, move to DefaultChangelogTemplatesConfig
+    # TODO: BREAKING CHANGE v11, move to DefaultChangelogTemplatesConfig
     changelog_file: str = ""
     """Deprecated! Moved to 'default_templates.changelog_file'"""
 
@@ -153,14 +159,28 @@ class ChangelogConfig(BaseModel):
     )
     environment: ChangelogEnvironmentConfig = ChangelogEnvironmentConfig()
     exclude_commit_patterns: Tuple[str, ...] = ()
-    mode: ChangelogMode = ChangelogMode.INIT
+    mode: ChangelogMode = ChangelogMode.UPDATE
     insertion_flag: str = ""
     template_dir: str = "templates"
+
+    @field_validator("exclude_commit_patterns", mode="after")
+    @classmethod
+    def validate_match(cls, patterns: Tuple[str, ...]) -> Tuple[str, ...]:
+        curr_index = 0
+        try:
+            for i, pattern in enumerate(patterns):
+                curr_index = i
+                regexp(pattern)
+        except RegExpError as err:
+            raise ValueError(
+                f"exclude_commit_patterns[{curr_index}]: Invalid regular expression"
+            ) from err
+        return patterns
 
     @field_validator("changelog_file", mode="after")
     @classmethod
     def changelog_file_deprecation_warning(cls, val: str) -> str:
-        log.warning(
+        logger.warning(
             str.join(
                 " ",
                 [
@@ -173,7 +193,7 @@ class ChangelogConfig(BaseModel):
 
     @model_validator(mode="after")
     def move_changelog_file(self) -> Self:
-        # TODO: Remove this method in v10
+        # TODO: Remove this method in v11
         if not self.changelog_file:
             return self
 
@@ -228,8 +248,8 @@ class BranchConfig(BaseModel):
             return ".*"
 
         try:
-            re.compile(match)
-        except re.error as err:
+            regexp(match)
+        except RegExpError as err:
             raise ValueError(f"Invalid regex {match!r}") from err
         return match
 
@@ -267,15 +287,18 @@ class RemoteConfig(BaseModel):
 
     def _get_default_token(self) -> str | None:
         hvcs_client_class = _known_hvcs[self.type]
-        default_hvcs_instance = hvcs_client_class("git@example.com:owner/project.git")
-        if not isinstance(default_hvcs_instance, RemoteHvcsBase):
-            return None
 
-        default_token_name = default_hvcs_instance.DEFAULT_ENV_TOKEN_NAME
-        if not default_token_name:
-            return None
+        default_token_name = (
+            getattr(hvcs_client_class, "DEFAULT_ENV_TOKEN_NAME")  # noqa: B009
+            if hasattr(hvcs_client_class, "DEFAULT_ENV_TOKEN_NAME")
+            else ""
+        )
 
-        return EnvConfigVar(env=default_token_name).getvalue()
+        return (
+            EnvConfigVar(env=default_token_name).getvalue()
+            if default_token_name
+            else None
+        )
 
     @model_validator(mode="after")
     def check_url_scheme(self) -> Self:
@@ -307,7 +330,7 @@ class RemoteConfig(BaseModel):
             )
 
         if scheme == "https" and self.insecure:
-            log.warning(
+            logger.warning(
                 str.join(
                     "\n",
                     [
@@ -333,16 +356,17 @@ class RawConfig(BaseModel):
         env="GIT_COMMIT_AUTHOR", default=DEFAULT_COMMIT_AUTHOR
     )
     commit_message: str = COMMIT_MESSAGE
-    commit_parser: NonEmptyString = "angular"
+    commit_parser: NonEmptyString = "conventional"
     # It's up to the parser_options() method to validate these
     commit_parser_options: Dict[str, Any] = {}
     logging_use_named_masks: bool = False
     major_on_zero: bool = True
-    allow_zero_version: bool = True
+    allow_zero_version: bool = False
     repo_dir: Annotated[Path, Field(validate_default=True)] = Path(".")
     remote: RemoteConfig = RemoteConfig()
     no_git_verify: bool = False
     tag_format: str = "v{version}"
+    add_partial_tags: bool = False
     publish: PublishConfig = PublishConfig()
     version_toml: Optional[Tuple[str, ...]] = None
     version_variables: Optional[Tuple[str, ...]] = None
@@ -360,9 +384,12 @@ class RawConfig(BaseModel):
         try:
             # Check for repository & walk up parent directories
             with Repo(str(dir_path), search_parent_directories=True) as git_repo:
-                found_path = Path(
-                    git_repo.working_tree_dir or git_repo.working_dir
-                ).absolute()
+                found_path = (
+                    Path(git_repo.working_tree_dir or git_repo.working_dir)
+                    .expanduser()
+                    .absolute()
+                )
+
         except InvalidGitRepositoryError as err:
             raise InvalidGitRepositoryError("No valid git repository found!") from err
 
@@ -370,19 +397,36 @@ class RawConfig(BaseModel):
             logging.warning(
                 "Found .git/ in higher parent directory rather than provided in configuration."
             )
-        return found_path
+
+        return found_path.resolve()
 
     @field_validator("commit_parser", mode="after")
     @classmethod
     def tag_commit_parser_deprecation_warning(cls, val: str) -> str:
         if val == "tag":
-            log.warning(
+            logger.warning(
                 str.join(
                     " ",
                     [
                         "The legacy 'tag' parser is deprecated and will be removed in v11.",
                         "Recommend swapping to our emoji parser (higher-compatibility)",
                         "or switch to another supported parser.",
+                    ],
+                )
+            )
+        return val
+
+    @field_validator("commit_parser", mode="after")
+    @classmethod
+    def angular_commit_parser_deprecation_warning(cls, val: str) -> str:
+        if val == "angular":
+            logger.warning(
+                str.join(
+                    " ",
+                    [
+                        "The 'angular' parser is deprecated and will be removed in v11.",
+                        "The Angular parser is being renamed to the conventional commit parser,",
+                        "which is selected by switching the 'commit_parser' value to 'conventional'.",
                     ],
                 )
             )
@@ -400,7 +444,7 @@ class RawConfig(BaseModel):
             parser_opts_type = None
             # If the commit parser is a known one, pull the default options object from it
             if self.commit_parser in _known_commit_parsers:
-                # TODO: BREAKING CHANGE v10
+                # TODO: BREAKING CHANGE v11
                 # parser_opts_type = (
                 #     _known_commit_parsers[self.commit_parser]
                 #     .get_default_options()
@@ -413,7 +457,7 @@ class RawConfig(BaseModel):
                 try:
                     # if its a custom parser, try to import it and pull the default options object type
                     custom_class = dynamic_import(self.commit_parser)
-                    # TODO: BREAKING CHANGE v10
+                    # TODO: BREAKING CHANGE v11
                     # parser_opts_type = custom_class.get_default_options().__class__
                     if hasattr(custom_class, "parser_options"):
                         parser_opts_type = custom_class.parser_options
@@ -499,6 +543,7 @@ def _recursive_getattr(obj: Any, path: str) -> Any:
 class RuntimeContext:
     _mask_attrs_: ClassVar[List[str]] = ["hvcs_client.token"]
 
+    project_metadata: dict[str, Any]
     repo_dir: Path
     commit_parser: CommitParser[ParseResult, ParserOptions]
     version_translator: VersionTranslator
@@ -509,8 +554,8 @@ class RuntimeContext:
     assets: List[str]
     commit_author: Actor
     commit_message: str
-    changelog_excluded_commit_patterns: Tuple[re.Pattern[str], ...]
-    version_declarations: Tuple[VersionDeclarationABC, ...]
+    changelog_excluded_commit_patterns: Tuple[Pattern[str], ...]
+    version_declarations: Tuple[IVersionReplacer, ...]
     hvcs_client: hvcs.HvcsBase
     changelog_insertion_flag: str
     changelog_mask_initial_release: bool
@@ -541,15 +586,15 @@ class RuntimeContext:
         choices: Dict[str, BranchConfig], active_branch: str
     ) -> BranchConfig:
         for group, options in choices.items():
-            if re.match(options.match, active_branch):
-                log.info(
+            if regexp(options.match).match(active_branch):
+                logger.info(
                     "Using group %r options, as %r matches %r",
                     group,
                     options.match,
                     active_branch,
                 )
                 return options
-            log.debug(
+            logger.debug(
                 "Rejecting group %r as %r doesn't match %r",
                 group,
                 options.match,
@@ -575,10 +620,30 @@ class RuntimeContext:
         # credentials masking for logging
         masker = MaskingFilter(_use_named_masks=raw.logging_use_named_masks)
 
+        # TODO: move to config if we change how the generated config is constructed
+        # Retrieve project metadata from pyproject.toml
+        project_metadata: dict[str, str] = {}
+        curr_dir = Path.cwd().resolve()
+        allowed_directories = [
+            dir_path
+            for dir_path in [curr_dir, *curr_dir.parents]
+            if str(raw.repo_dir) in str(dir_path)
+        ]
+        for allowed_dir in allowed_directories:
+            if (proj_toml := allowed_dir.joinpath("pyproject.toml")).exists():
+                config_toml = tomlkit.parse(proj_toml.read_text())
+                project_metadata = config_toml.unwrap().get("project", project_metadata)
+                break
+
         # Retrieve details from repository
         with Repo(str(raw.repo_dir)) as git_repo:
             try:
-                remote_url = raw.remote.url or git_repo.remote(raw.remote.name).url
+                # Get the remote url by calling out to `git remote get-url`. This returns
+                # the expanded url, taking into account any insteadOf directives
+                # in the git configuration.
+                remote_url = raw.remote.url or git_repo.git.remote(
+                    "get-url", raw.remote.name
+                )
                 active_branch = git_repo.active_branch.name
             except ValueError as err:
                 raise MissingGitRemote(
@@ -600,6 +665,17 @@ class RuntimeContext:
                 if raw.commit_parser in _known_commit_parsers
                 else dynamic_import(raw.commit_parser)
             )
+        except ValueError as err:
+            raise ParserLoadError(
+                str.join(
+                    "\n",
+                    [
+                        f"Unrecognized commit parser value: {raw.commit_parser!r}.",
+                        str(err),
+                        "Unable to load the given parser! Check your configuration!",
+                    ],
+                )
+            ) from err
         except ModuleNotFoundError as err:
             raise ParserLoadError(
                 str.join(
@@ -622,7 +698,7 @@ class RuntimeContext:
             ) from err
 
         commit_parser_opts_class = commit_parser_cls.parser_options
-        # TODO: Breaking change v10
+        # TODO: Breaking change v11
         # commit_parser_opts_class = commit_parser_cls.get_default_options().__class__
         try:
             commit_parser = commit_parser_cls(
@@ -635,12 +711,21 @@ class RuntimeContext:
 
         # We always exclude PSR's own release commits from the Changelog
         # when parsing commits
-        _psr_release_commit_re = re.compile(
-            raw.commit_message.replace(r"{version}", r"(?P<version>.*)")
+        psr_release_commit_regex = regexp(
+            reduce(
+                lambda regex_str, pattern: str(regex_str).replace(*pattern),
+                (
+                    # replace the version holder with a regex pattern to match various versions
+                    (regex_escape("{version}"), r"(?P<version>\d+\.\d+\.\d+\S*)"),
+                    # TODO: add any other placeholders here
+                ),
+                # We use re.escape to ensure that the commit message is treated as a literal
+                regex_escape(raw.commit_message.strip()),
+            )
         )
         changelog_excluded_commit_patterns = (
-            _psr_release_commit_re,
-            *(re.compile(pattern) for pattern in raw.changelog.exclude_commit_patterns),
+            psr_release_commit_regex,
+            *(regexp(pattern) for pattern in raw.changelog.exclude_commit_patterns),
         )
 
         _commit_author_str = cls.resolve_from_env(raw.commit_author) or ""
@@ -653,51 +738,48 @@ class RuntimeContext:
 
         commit_author = Actor(*_commit_author_valid.groups())
 
-        version_declarations: list[VersionDeclarationABC] = []
-        for decl in () if raw.version_toml is None else raw.version_toml:
-            try:
-                path, search_text = decl.split(":", maxsplit=1)
-                # VersionDeclarationABC handles path existence check
-                vd = TomlVersionDeclaration(path, search_text)
-            except ValueError as exc:
-                log.exception("Invalid TOML declaration %r", decl)
-                raise InvalidConfiguration(
-                    f"Invalid TOML declaration {decl!r}"
-                ) from exc
+        version_declarations: list[IVersionReplacer] = []
 
-            version_declarations.append(vd)
-
-        for decl in () if raw.version_variables is None else raw.version_variables:
-            try:
-                path, variable = decl.split(":", maxsplit=1)
-                # VersionDeclarationABC handles path existence check
-                search_text = str.join(
-                    "",
+        try:
+            version_declarations.extend(
+                TomlVersionDeclaration.from_string_definition(definition)
+                for definition in iter(raw.version_toml or ())
+            )
+        except ValueError as err:
+            raise InvalidConfiguration(
+                str.join(
+                    "\n",
                     [
-                        # Supports optional matching quotations around variable name
-                        # Negative lookbehind to ensure we don't match part of a variable name
-                        f"""(?x)(?P<quote1>['"])?(?<![\\w.-]){variable}(?P=quote1)?""",
-                        # Supports walrus, equals sign, or colon as assignment operator ignoring whitespace separation
-                        r"\s*(:=|[:=])\s*",
-                        # Supports optional matching quotations around version number of a SEMVER pattern
-                        f"""(?P<quote2>['"])?(?P<version>{SEMVER_REGEX.pattern})(?P=quote2)?""",
+                        "Invalid 'version_toml' configuration",
+                        str(err),
                     ],
                 )
-                pd = PatternVersionDeclaration(path, search_text)
-            except ValueError as exc:
-                log.exception("Invalid variable declaration %r", decl)
-                raise InvalidConfiguration(
-                    f"Invalid variable declaration {decl!r}"
-                ) from exc
+            ) from err
 
-            version_declarations.append(pd)
+        try:
+            version_declarations.extend(
+                PatternVersionDeclaration.from_string_definition(
+                    definition, raw.tag_format
+                )
+                for definition in iter(raw.version_variables or ())
+            )
+        except ValueError as err:
+            raise InvalidConfiguration(
+                str.join(
+                    "\n",
+                    [
+                        "Invalid 'version_variables' configuration",
+                        str(err),
+                    ],
+                )
+            ) from err
 
         # Provide warnings if the token is missing
         if not raw.remote.token:
-            log.debug("hvcs token is not set")
+            logger.debug("hvcs token is not set")
 
             if not raw.remote.ignore_token_for_push:
-                log.warning("Token value is missing!")
+                logger.warning("Token value is missing!")
 
         # hvcs_client
         hvcs_client_cls = _known_hvcs[raw.remote.type]
@@ -746,7 +828,9 @@ class RuntimeContext:
 
         # version_translator
         version_translator = VersionTranslator(
-            tag_format=raw.tag_format, prerelease_token=branch_config.prerelease_token
+            tag_format=raw.tag_format,
+            prerelease_token=branch_config.prerelease_token,
+            add_partial_tags=raw.add_partial_tags,
         )
 
         build_cmd_env = {}
@@ -779,14 +863,15 @@ class RuntimeContext:
         # Here we just assume the desired changelog style matches the parser name
         # as we provide templates specific to each parser type. Unfortunately if the user has
         # provided a custom parser, it would be up to the user to provide custom templates
-        # but we just assume the base template is angular
+        # but we just assume the base template is conventional
         # changelog_style = (
         #     raw.commit_parser
         #     if raw.commit_parser in _known_commit_parsers
-        #     else "angular"
+        #     else "conventional"
         # )
 
         self = cls(
+            project_metadata=project_metadata,
             repo_dir=raw.repo_dir,
             commit_parser=commit_parser,
             version_translator=version_translator,
@@ -806,7 +891,7 @@ class RuntimeContext:
             changelog_excluded_commit_patterns=changelog_excluded_commit_patterns,
             # TODO: change when we have other styles per parser
             # changelog_style=changelog_style,
-            changelog_style="angular",
+            changelog_style="conventional",
             changelog_output_format=raw.changelog.default_templates.output_format,
             prerelease=branch_config.prerelease,
             ignore_token_for_push=raw.remote.ignore_token_for_push,

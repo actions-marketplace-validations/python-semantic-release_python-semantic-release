@@ -8,17 +8,23 @@ import stat
 import string
 from contextlib import contextmanager, suppress
 from pathlib import Path
+from re import compile as regexp
 from textwrap import indent
 from typing import TYPE_CHECKING, Tuple
 
-from git import Repo
+from git import Git, Repo
 from pydantic.dataclasses import dataclass
 
 from semantic_release.changelog.context import ChangelogMode, make_changelog_context
 from semantic_release.changelog.release_history import ReleaseHistory
-from semantic_release.cli import config as cli_config_module
 from semantic_release.commit_parser._base import CommitParser, ParserOptions
-from semantic_release.commit_parser.token import ParsedCommit, ParseResult
+from semantic_release.commit_parser.conventional import ConventionalCommitParser
+from semantic_release.commit_parser.token import (
+    ParsedCommit,
+    ParsedMessageResult,
+    ParseError,
+    ParseResult,
+)
 from semantic_release.enums import LevelBump
 
 from tests.const import SUCCESS_EXIT_CODE
@@ -28,10 +34,10 @@ if TYPE_CHECKING:
     from typing import Any, Callable, Generator, Iterable, TypeVar
 
     try:
-        from typing import TypeAlias
-    except ImportError:
-        # for python 3.8 and 3.9
+        # Python 3.8 and 3.9 compatibility
         from typing_extensions import TypeAlias
+    except ImportError:
+        from typing import TypeAlias  # type: ignore[attr-defined, no-redef]
 
     from unittest.mock import MagicMock
 
@@ -39,11 +45,10 @@ if TYPE_CHECKING:
     from git import Commit
 
     from semantic_release.cli.config import RuntimeContext
-    from semantic_release.commit_parser.token import ParseError
 
     _R = TypeVar("_R")
 
-    GitCommandWrapperType: TypeAlias = cli_config_module.Repo.GitCommandWrapperType
+    GitCommandWrapperType: TypeAlias = Git
 
 
 def get_func_qual_name(func: Callable) -> str:
@@ -53,27 +58,21 @@ def get_func_qual_name(func: Callable) -> str:
 def assert_exit_code(
     exit_code: int, result: ClickInvokeResult, cli_cmd: list[str]
 ) -> bool:
-    if result.exit_code != exit_code:
-        raise AssertionError(
-            str.join(
-                os.linesep,
-                [
-                    f"{result.exit_code} != {exit_code} (actual != expected)",
-                    "",
-                    # Explain what command failed
-                    "Unexpected exit code from command:",
-                    # f"  '{str.join(' ', cli_cmd)}'",
-                    indent(f"'{str.join(' ', cli_cmd)}'", " " * 2),
-                    "",
-                    # Add indentation to each line for stdout & stderr
-                    "stdout:",
-                    indent(result.stdout, " " * 2),
-                    "stderr:",
-                    indent(result.stderr, " " * 2),
-                ],
-            )
+    if result.exit_code == exit_code:
+        return True
+
+    raise AssertionError(
+        str.join(
+            os.linesep,
+            [
+                f"{result.exit_code} != {exit_code} (actual != expected)",
+                "",
+                # Explain what command failed
+                "Unexpected exit code from command:",
+                indent(f"'{str.join(' ', cli_cmd)}'", " " * 2),
+            ],
         )
-    return True
+    )
 
 
 def assert_successful_exit_code(result: ClickInvokeResult, cli_cmd: list[str]) -> bool:
@@ -125,8 +124,8 @@ def remove_dir_tree(directory: Path | str = ".", force: bool = False) -> None:
 
 def dynamic_python_import(file_path: Path, module_name: str):
     spec = importlib.util.spec_from_file_location(module_name, str(file_path))
-    module = importlib.util.module_from_spec(spec)  # type: ignore
-    spec.loader.exec_module(module)  # type: ignore
+    module = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+    spec.loader.exec_module(module)  # type: ignore[union-attr]
     return module
 
 
@@ -147,11 +146,24 @@ def shortuid(length: int = 8) -> str:
 
 
 def add_text_to_file(repo: Repo, filename: str, text: str | None = None):
-    with open(f"{repo.working_tree_dir}/{filename}", "a+") as f:
-        f.write(text or f"default text {shortuid(12)}")
-        f.write(os.linesep)
+    """Makes a deterministic file change for testing"""
+    tgt_file = Path(filename).resolve().absolute()
 
-    repo.index.add(filename)
+    # TODO: switch to Path.is_relative_to() when 3.8 support is deprecated
+    # if not tgt_file.is_relative_to(Path(repo.working_dir).resolve().absolute()):
+    if Path(repo.working_dir).resolve().absolute() not in tgt_file.parents:
+        raise ValueError(
+            f"File {tgt_file} is not relative to the repository working directory {repo.working_dir}"
+        )
+
+    tgt_file.parent.mkdir(parents=True, exist_ok=True)
+    file_contents = tgt_file.read_text() if tgt_file.exists() else ""
+    line_number = len(file_contents.splitlines())
+
+    file_contents += f"{line_number}  {text or 'default text'}{os.linesep}"
+    tgt_file.write_text(file_contents, encoding="utf-8")
+
+    repo.index.add(tgt_file)
 
 
 def flatten_dircmp(dcmp: filecmp.dircmp) -> list[str]:
@@ -182,7 +194,38 @@ def xdist_sort_hack(it: Iterable[_R]) -> Iterable[_R]:
 
 
 def actions_output_to_dict(output: str) -> dict[str, str]:
-    return {line.split("=")[0]: line.split("=")[1] for line in output.splitlines()}
+    single_line_var_pattern = regexp(r"^(?P<name>\w+)=(?P<value>.*?)\r?$")
+    multiline_var_pattern = regexp(r"^(?P<name>\w+?)<<EOF\r?$")
+    multiline_var_pattern_end = regexp(r"^EOF\r?$")
+
+    found_multiline_var = False
+    current_var_name = ""
+    current_var_value = ""
+    result: dict[str, str] = {}
+    for line in output.splitlines(keepends=True):
+        if found_multiline_var:
+            if match := multiline_var_pattern_end.match(line):
+                # End of a multiline variable
+                found_multiline_var = False
+                result[current_var_name] = current_var_value
+                continue
+
+            current_var_value += line
+            continue
+
+        if match := single_line_var_pattern.match(line):
+            # Single line variable
+            result[match.group("name")] = match.group("value")
+            continue
+
+        if match := multiline_var_pattern.match(line):
+            # Start of a multiline variable
+            found_multiline_var = True
+            current_var_name = match.group("name")
+            current_var_value = ""
+            continue
+
+    return result
 
 
 def get_release_history_from_context(runtime_context: RuntimeContext) -> ReleaseHistory:
@@ -233,7 +276,7 @@ def prepare_mocked_git_command_wrapper_type(
     >>> mocked_push.assert_called_once()
     """
 
-    class MockGitCommandWrapperType(cli_config_module.Repo.GitCommandWrapperType):
+    class MockGitCommandWrapperType(Git):
         def __getattr__(self, name: str) -> Any:
             try:
                 return object.__getattribute__(self, f"mocked_{name}")
@@ -278,3 +321,21 @@ class CustomParserWithOpts(CommitParser[ParseResult, CustomParserOpts]):
 
 class IncompleteCustomParser(CommitParser):
     pass
+
+
+class CustomConventionalParserWithIgnorePatterns(ConventionalCommitParser):
+    def parse(self, commit: Commit) -> ParsedCommit | ParseError:
+        if not (parse_msg_result := super().parse_message(str(commit.message))):
+            return ParseError(commit, "Unable to parse commit")
+
+        return ParsedCommit.from_parsed_message_result(
+            commit,
+            ParsedMessageResult(
+                **{
+                    **parse_msg_result._asdict(),
+                    "include_in_changelog": bool(
+                        not str(commit.message).startswith("chore")
+                    ),
+                }
+            ),
+        )

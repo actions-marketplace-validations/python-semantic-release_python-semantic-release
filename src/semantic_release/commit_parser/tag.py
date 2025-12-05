@@ -1,6 +1,7 @@
 """Legacy commit parser from Python Semantic Release 1.0"""
 
-import logging
+from __future__ import annotations
+
 import re
 
 from git.objects.commit import Commit
@@ -10,8 +11,7 @@ from semantic_release.commit_parser._base import CommitParser, ParserOptions
 from semantic_release.commit_parser.token import ParsedCommit, ParseError, ParseResult
 from semantic_release.commit_parser.util import breaking_re, parse_paragraphs
 from semantic_release.enums import LevelBump
-
-logger = logging.getLogger(__name__)
+from semantic_release.globals import logger
 
 re_parser = re.compile(r"(?P<subject>[^\n]+)" + r"(:?\n\n(?P<text>.+))?", re.DOTALL)
 
@@ -41,7 +41,7 @@ class TagCommitParser(CommitParser[ParseResult, TagParserOptions]):
     def get_default_options() -> TagParserOptions:
         return TagParserOptions()
 
-    def parse(self, commit: Commit) -> ParseResult:
+    def parse(self, commit: Commit) -> ParseResult | list[ParseResult]:
         message = str(commit.message)
 
         # Attempt to parse the commit message with a regular expression

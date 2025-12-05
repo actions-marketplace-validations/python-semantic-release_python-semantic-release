@@ -1,19 +1,23 @@
-"""Note: fixtures are stored in the tests/fixtures directory for better organisation"""
+"""Note: fixtures are stored in the tests/fixtures directory for better organization"""
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from datetime import datetime, timedelta, timezone
 from hashlib import md5
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
+from unittest import mock
 
 import pytest
 from click.testing import CliRunner
 from filelock import FileLock
 from git import Commit, Repo
+
+from semantic_release.version.version import Version
 
 from tests.const import PROJ_DIR
 from tests.fixtures import *
@@ -21,9 +25,37 @@ from tests.util import copy_dir_tree, remove_dir_tree
 
 if TYPE_CHECKING:
     from tempfile import _TemporaryFileWrapper
-    from typing import Callable, Generator, Protocol, Sequence, TypedDict
+    from typing import Any, Callable, Generator, Optional, Protocol, Sequence, TypedDict
 
+    from click.testing import Result
     from filelock import AcquireReturnProxy
+    from git import Actor
+
+    from tests.fixtures.git_repo import RepoActions
+
+    class RunCliFn(Protocol):
+        """
+        Run the CLI with the provided arguments and a clean environment.
+
+        :param argv: The arguments to pass to the CLI.
+        :type argv: list[str] | None
+
+        :param env: The environment variables to set for the CLI.
+        :type env: dict[str, str] | None
+
+        :param invoke_kwargs: Additional arguments to pass to the invoke method.
+        :type invoke_kwargs: dict[str, Any] | None
+
+        :return: The result of the CLI invocation.
+        :rtype: Result
+        """
+
+        def __call__(
+            self,
+            argv: list[str] | None = None,
+            env: dict[str, str] | None = None,
+            invoke_kwargs: dict[str, Any] | None = None,
+        ) -> Result: ...
 
     class MakeCommitObjFn(Protocol):
         def __call__(self, message: str) -> Commit: ...
@@ -62,13 +94,14 @@ if TYPE_CHECKING:
             self,
             repo_name: str,
             build_spec_hash: str,
-            build_repo_func: Callable[[Path], None],
+            build_repo_func: Callable[[Path], Sequence[RepoActions]],
             dest_dir: Path | None = None,
         ) -> Path: ...
 
     class RepoData(TypedDict):
         build_date: str
         build_spec_hash: str
+        build_definition: Sequence[RepoActions]
 
     class GetCachedRepoDataFn(Protocol):
         def __call__(self, proj_dirname: str) -> RepoData | None: ...
@@ -163,6 +196,34 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
 @pytest.fixture
 def cli_runner() -> CliRunner:
     return CliRunner(mix_stderr=False)
+
+
+@pytest.fixture(scope="session")
+def run_cli(clean_os_environment: dict[str, str]) -> RunCliFn:
+    def _run_cli(
+        argv: list[str] | None = None,
+        env: dict[str, str] | None = None,
+        invoke_kwargs: dict[str, Any] | None = None,
+    ) -> Result:
+        from semantic_release.cli.commands.main import main
+        from semantic_release.globals import logger
+
+        # Prevent logs from being propagated to the root logger (pytest)
+        logger.propagate = False
+
+        cli_runner = CliRunner(mix_stderr=False)
+        env_vars = {**clean_os_environment, **(env or {})}
+        args = ["-vv", *(argv or [])]
+
+        with mock.patch.dict(os.environ, env_vars, clear=True):
+            # run the CLI with the provided arguments
+            result = cli_runner.invoke(main, args=args, **(invoke_kwargs or {}))
+            # Force the output to be printed to stdout which will be captured by pytest
+            sys.stdout.write(result.stdout)
+            sys.stderr.write(result.stderr)
+            return result
+
+    return _run_cli
 
 
 @pytest.fixture(scope="session")
@@ -274,16 +335,28 @@ def get_authorization_to_build_repo_cache(
 def get_cached_repo_data(request: pytest.FixtureRequest) -> GetCachedRepoDataFn:
     def _get_cached_repo_data(proj_dirname: str) -> RepoData | None:
         cache_key = f"psr/repos/{proj_dirname}"
-        return request.config.cache.get(cache_key, None)
+        return cast("Optional[RepoData]", request.config.cache.get(cache_key, None))
 
     return _get_cached_repo_data
 
 
 @pytest.fixture(scope="session")
 def set_cached_repo_data(request: pytest.FixtureRequest) -> SetCachedRepoDataFn:
+    def magic_serializer(obj: Any) -> Any:
+        if isinstance(obj, Path):
+            return obj.__fspath__()
+
+        if isinstance(obj, Version):
+            return obj.__dict__
+
+        return obj
+
     def _set_cached_repo_data(proj_dirname: str, data: RepoData) -> None:
         cache_key = f"psr/repos/{proj_dirname}"
-        request.config.cache.set(cache_key, data)
+        request.config.cache.set(
+            cache_key,
+            json.loads(json.dumps(data, default=magic_serializer)),
+        )
 
     return _set_cached_repo_data
 
@@ -303,7 +376,7 @@ def build_repo_or_copy_cache(
     def _build_repo_w_cache_checking(
         repo_name: str,
         build_spec_hash: str,
-        build_repo_func: Callable[[Path], None],
+        build_repo_func: Callable[[Path], Sequence[RepoActions]],
         dest_dir: Path | None = None,
     ) -> Path:
         # Blocking mechanism to synchronize xdist workers
@@ -327,7 +400,22 @@ def build_repo_or_copy_cache(
             with log_file_lock, log_file.open(mode="a") as afd:
                 afd.write(f"{stable_now_date().isoformat()}: {build_msg}...\n")
 
-            build_repo_func(cached_repo_path)
+            try:
+                # Try to build repository but catch any errors so that it doesn't cascade through all tests
+                # do to an unreleased lock
+                build_definition = build_repo_func(cached_repo_path)
+            except Exception:
+                remove_dir_tree(cached_repo_path, force=True)
+
+                if filelock:
+                    filelock.lock.release()
+
+                with log_file_lock, log_file.open(mode="a") as afd:
+                    afd.write(
+                        f"{stable_now_date().isoformat()}: {build_msg}...FAILED\n"
+                    )
+
+                raise
 
             # Marks the date when the cached repo was created
             set_cached_repo_data(
@@ -335,6 +423,7 @@ def build_repo_or_copy_cache(
                 {
                     "build_date": today_date_str,
                     "build_spec_hash": build_spec_hash,
+                    "build_definition": build_definition,
                 },
             )
 
@@ -371,9 +460,21 @@ def teardown_cached_dir() -> Generator[TeardownCachedDirFn, None, None]:
 
 
 @pytest.fixture(scope="session")
-def make_commit_obj() -> MakeCommitObjFn:
+def make_commit_obj(
+    commit_author: Actor, stable_now_date: GetStableDateNowFn
+) -> MakeCommitObjFn:
     def _make_commit(message: str) -> Commit:
-        return Commit(repo=Repo(), binsha=Commit.NULL_BIN_SHA, message=message)
+        commit_timestamp = round(stable_now_date().timestamp())
+        return Commit(
+            repo=Repo(),
+            binsha=Commit.NULL_BIN_SHA,
+            message=message,
+            author=commit_author,
+            authored_date=commit_timestamp,
+            committer=commit_author,
+            committed_date=commit_timestamp,
+            parents=[],
+        )
 
     return _make_commit
 
@@ -437,9 +538,9 @@ def get_md5_for_set_of_files(
 
 @pytest.fixture(scope="session")
 def clean_os_environment() -> dict[str, str]:
-    return dict(  # type: ignore
+    return dict(
         filter(
-            lambda k_v: k_v[1] is not None,
+            lambda k_v: k_v[1] is not None,  # type: ignore[arg-type]
             {
                 "PATH": os.getenv("PATH"),
                 "HOME": os.getenv("HOME"),

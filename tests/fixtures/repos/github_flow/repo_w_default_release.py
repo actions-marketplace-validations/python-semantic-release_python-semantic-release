@@ -1,43 +1,57 @@
 from __future__ import annotations
 
+from datetime import timedelta
+from itertools import count
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import pytest
-from git import Repo
 
 from semantic_release.cli.config import ChangelogOutputFormat
+from semantic_release.version.version import Version
 
 import tests.conftest
 import tests.const
 import tests.util
-from tests.const import DEFAULT_BRANCH_NAME, EXAMPLE_HVCS_DOMAIN, INITIAL_COMMIT_MESSAGE
-from tests.util import temporary_working_directory
+from tests.const import (
+    DEFAULT_BRANCH_NAME,
+    EXAMPLE_HVCS_DOMAIN,
+    INITIAL_COMMIT_MESSAGE,
+    RepoActionStep,
+)
 
 if TYPE_CHECKING:
-    from semantic_release.hvcs import HvcsBase
+    from typing import Any, Sequence
 
-    from tests.conftest import GetMd5ForSetOfFilesFn
-    from tests.fixtures.example_project import (
-        ExProjectDir,
+    from semantic_release.commit_parser._base import CommitParser, ParserOptions
+    from semantic_release.commit_parser.conventional.parser import (
+        ConventionalCommitParser,
     )
+    from semantic_release.commit_parser.emoji import EmojiCommitParser
+    from semantic_release.commit_parser.scipy import ScipyCommitParser
+    from semantic_release.commit_parser.token import ParseResult
+
+    from tests.conftest import (
+        GetCachedRepoDataFn,
+        GetMd5ForSetOfFilesFn,
+        GetStableDateNowFn,
+    )
+    from tests.fixtures.example_project import ExProjectDir
     from tests.fixtures.git_repo import (
-        BaseRepoVersionDef,
-        BuildRepoFn,
+        BuildRepoFromDefinitionFn,
         BuildRepoOrCopyCacheFn,
+        BuildSpecificRepoFn,
+        BuiltRepoResult,
         CommitConvention,
-        CreateReleaseFn,
-        CreateSquashMergeCommitFn,
+        CommitSpec,
+        ConvertCommitSpecsToCommitDefsFn,
+        ConvertCommitSpecToCommitDefFn,
         ExProjectGitRepoFn,
-        ExtractRepoDefinitionFn,
         FormatGitHubSquashCommitMsgFn,
         GetRepoDefinitionFn,
-        GetVersionStringsFn,
-        RepoDefinition,
-        SimulateChangeCommitsNReturnChangelogEntryFn,
-        SimulateDefaultChangelogCreationFn,
+        RepoActions,
+        RepoActionWriteChangelogsDestFile,
         TomlSerializableTypes,
-        VersionStr,
     )
 
 
@@ -62,7 +76,7 @@ def deps_files_4_github_flow_repo_w_default_release_channel(
 
 
 @pytest.fixture(scope="session")
-def build_spec_hash_for_github_flow_repo_w_default_release_channel(
+def build_spec_hash_4_github_flow_repo_w_default_release_channel(
     get_md5_for_set_of_files: GetMd5ForSetOfFilesFn,
     deps_files_4_github_flow_repo_w_default_release_channel: list[Path],
 ) -> str:
@@ -73,345 +87,407 @@ def build_spec_hash_for_github_flow_repo_w_default_release_channel(
 
 
 @pytest.fixture(scope="session")
-def get_commits_for_github_flow_repo_w_default_release_channel(
-    extract_commit_convention_from_base_repo_def: ExtractRepoDefinitionFn,
+def get_repo_definition_4_github_flow_repo_w_default_release_channel(
+    convert_commit_specs_to_commit_defs: ConvertCommitSpecsToCommitDefsFn,
+    convert_commit_spec_to_commit_def: ConvertCommitSpecToCommitDefFn,
     format_squash_commit_msg_github: FormatGitHubSquashCommitMsgFn,
-) -> GetRepoDefinitionFn:
-    base_definition: dict[str, BaseRepoVersionDef] = {
-        "1.0.0": {
-            "changelog_sections": {
-                "angular": [{"section": "Features", "i_commits": [1]}],
-                "emoji": [
-                    {"section": ":sparkles:", "i_commits": [1]},
-                    {"section": "Other", "i_commits": [0]},
-                ],
-                "scipy": [{"section": "Feature", "i_commits": [1]}],
-            },
-            "commits": [
-                {
-                    "angular": INITIAL_COMMIT_MESSAGE,
-                    "emoji": INITIAL_COMMIT_MESSAGE,
-                    "scipy": INITIAL_COMMIT_MESSAGE,
-                },
-                {
-                    "angular": "feat: add new feature",
-                    "emoji": ":sparkles: add new feature",
-                    "scipy": "ENH: add new feature",
-                },
-            ],
-        },
-        "1.0.1": {
-            "changelog_sections": {
-                "angular": [
-                    {"section": "Bug Fixes", "i_commits": [1]},
-                ],
-                "emoji": [
-                    {"section": ":bug:", "i_commits": [1]},
-                ],
-                "scipy": [
-                    {"section": "Fix", "i_commits": [1]},
-                ],
-            },
-            "commits": [
-                {
-                    "angular": "fix(cli): add missing text",
-                    "emoji": ":bug: add missing text",
-                    "scipy": "MAINT: add missing text",
-                },
-                # Placeholder for the squash commit
-                {"angular": "", "emoji": "", "scipy": ""},
-            ],
-        },
-        "1.1.0": {
-            "changelog_sections": {
-                "angular": [
-                    {"section": "Features", "i_commits": [3]},
-                    # TODO: when squash commits are parsed
-                    # {"section": "Documentation", "i_commits": [2]},
-                    # {"section": "Features", "i_commits": [0]},
-                    # {"section": "Testing", "i_commits": [1]},
-                ],
-                "emoji": [
-                    {"section": ":sparkles:", "i_commits": [3]},
-                    # {"section": ":sparkles:", "i_commits": [0]},
-                    # {"section": "Other", "i_commits": [1, 2]},
-                ],
-                "scipy": [
-                    {"section": "Feature", "i_commits": [3]},
-                    # TODO: when squash commits are parsed
-                    # {"section": "Documentation", "i_commits": [2]},
-                    # {"section": "Feature", "i_commits": [0]},
-                    # {"section": "None", "i_commits": [1]},
-                ],
-            },
-            "commits": [
-                {
-                    "angular": "feat(cli): add cli interface",
-                    "emoji": ":sparkles: add cli interface",
-                    "scipy": "ENH: add cli interface",
-                },
-                {
-                    "angular": "test(cli): add cli tests",
-                    "emoji": ":checkmark: add cli tests",
-                    "scipy": "TST: add cli tests",
-                },
-                {
-                    "angular": "docs(cli): add cli documentation",
-                    "emoji": ":books: add cli documentation",
-                    "scipy": "DOC: add cli documentation",
-                },
-                # Placeholder for the squash commit
-                {"angular": "", "emoji": "", "scipy": ""},
-            ],
-        },
-    }
-
-    # Update the commit definition for the squash commit using the GitHub format
-    for i, (version_str, cmt_title_index) in enumerate(
-        (
-            ("1.0.1", 0),
-            ("1.1.0", 0),
-        ),
-        start=2,
-    ):
-        version_def = base_definition[version_str]
-        squash_commit_def: dict[CommitConvention, str] = {
-            # Create the squash commit message for each commit type
-            commit_type: format_squash_commit_msg_github(
-                # Use the primary commit message as the PR title
-                pr_title=version_def["commits"][cmt_title_index][commit_type],
-                pr_number=i,
-                squashed_commits=[
-                    cmt[commit_type]
-                    for cmt in version_def["commits"][:-1]
-                    # This assumes the squash commit is the last commit in the list
-                ],
-            )
-            for commit_type in version_def["changelog_sections"]
-        }
-        # Update the commit definition for the squash commit
-        version_def["commits"][-1] = squash_commit_def
-
-    # End loop
-
-    def _get_commits_for_github_flow_repo_w_default_release_channel(
-        commit_type: CommitConvention = "angular",
-    ) -> RepoDefinition:
-        return extract_commit_convention_from_base_repo_def(
-            base_definition,
-            commit_type,
-        )
-
-    return _get_commits_for_github_flow_repo_w_default_release_channel
-
-
-@pytest.fixture(scope="session")
-def get_versions_for_github_flow_repo_w_default_release_channel(
-    get_commits_for_github_flow_repo_w_default_release_channel: GetRepoDefinitionFn,
-) -> GetVersionStringsFn:
-    def _get_versions_for_github_flow_repo_w_default_release_channel() -> (
-        list[VersionStr]
-    ):
-        return list(get_commits_for_github_flow_repo_w_default_release_channel().keys())
-
-    return _get_versions_for_github_flow_repo_w_default_release_channel
-
-
-@pytest.fixture(scope="session")
-def build_github_flow_repo_w_default_release_channel(
-    get_commits_for_github_flow_repo_w_default_release_channel: GetRepoDefinitionFn,
-    build_configured_base_repo: BuildRepoFn,
-    default_tag_format_str: str,
-    simulate_change_commits_n_rtn_changelog_entry: SimulateChangeCommitsNReturnChangelogEntryFn,
-    create_release_tagged_commit: CreateReleaseFn,
-    create_squash_merge_commit: CreateSquashMergeCommitFn,
-    simulate_default_changelog_creation: SimulateDefaultChangelogCreationFn,
     changelog_md_file: Path,
     changelog_rst_file: Path,
-) -> BuildRepoFn:
+    stable_now_date: GetStableDateNowFn,
+    default_conventional_parser: ConventionalCommitParser,
+    default_emoji_parser: EmojiCommitParser,
+    default_scipy_parser: ScipyCommitParser,
+    default_tag_format_str: str,
+) -> GetRepoDefinitionFn:
     """
     Builds a repository with the GitHub Flow branching strategy and a squash commit merging strategy
     for a single release channel on the default branch.
     """
+    parser_classes: dict[CommitConvention, CommitParser[Any, Any]] = {
+        "conventional": default_conventional_parser,
+        "emoji": default_emoji_parser,
+        "scipy": default_scipy_parser,
+    }
 
-    def _build_github_flow_repo_w_default_release_channel(
-        dest_dir: Path | str,
-        commit_type: CommitConvention = "angular",
+    def _get_repo_from_definition(
+        commit_type: CommitConvention,
         hvcs_client_name: str = "github",
         hvcs_domain: str = EXAMPLE_HVCS_DOMAIN,
         tag_format_str: str | None = None,
         extra_configs: dict[str, TomlSerializableTypes] | None = None,
-        mask_initial_release: bool = False,
-    ) -> tuple[Path, HvcsBase]:
-        repo_dir, hvcs = build_configured_base_repo(
-            dest_dir,
-            commit_type=commit_type,
-            hvcs_client_name=hvcs_client_name,
-            hvcs_domain=hvcs_domain,
-            tag_format_str=tag_format_str,
-            mask_initial_release=mask_initial_release,
-            extra_configs={
-                # Set the default release branch
-                "tool.semantic_release.branches.main": {
-                    "match": r"^(main|master)$",
-                    "prerelease": False,
-                },
-                "tool.semantic_release.allow_zero_version": False,
-                **(extra_configs or {}),
+        mask_initial_release: bool = True,
+        ignore_merge_commits: bool = True,
+    ) -> Sequence[RepoActions]:
+        stable_now_datetime = stable_now_date()
+        commit_timestamp_gen = (
+            (stable_now_datetime + timedelta(seconds=i)).isoformat(timespec="seconds")
+            for i in count(step=1)
+        )
+        pr_num_gen = (i for i in count(start=2, step=1))
+        commit_parser = cast(
+            "CommitParser[ParseResult, ParserOptions]",
+            parser_classes[commit_type],
+        )
+
+        changelog_file_definitions: Sequence[RepoActionWriteChangelogsDestFile] = [
+            {
+                "path": changelog_md_file,
+                "format": ChangelogOutputFormat.MARKDOWN,
+                "mask_initial_release": mask_initial_release,
             },
+            {
+                "path": changelog_rst_file,
+                "format": ChangelogOutputFormat.RESTRUCTURED_TEXT,
+                "mask_initial_release": mask_initial_release,
+            },
+        ]
+
+        repo_construction_steps: list[RepoActions] = []
+
+        repo_construction_steps.append(
+            {
+                "action": RepoActionStep.CONFIGURE,
+                "details": {
+                    "commit_type": commit_type,
+                    "hvcs_client_name": hvcs_client_name,
+                    "hvcs_domain": hvcs_domain,
+                    "tag_format_str": tag_format_str or default_tag_format_str,
+                    "mask_initial_release": mask_initial_release,
+                    "extra_configs": {
+                        # Set the default release branch
+                        "tool.semantic_release.branches.main": {
+                            "match": r"^(main|master)$",
+                            "prerelease": False,
+                        },
+                        "tool.semantic_release.allow_zero_version": False,
+                        "tool.semantic_release.commit_parser_options.parse_squash_commits": True,
+                        "tool.semantic_release.commit_parser_options.ignore_merge_commits": ignore_merge_commits,
+                        **(extra_configs or {}),
+                    },
+                },
+            }
         )
 
-        # Retrieve/Define project vars that will be used to create the repo below
-        repo_def = get_commits_for_github_flow_repo_w_default_release_channel(
-            commit_type
+        new_version = Version.parse(
+            "1.0.0", tag_format=(tag_format_str or default_tag_format_str)
         )
-        versions = (key for key in repo_def)
-        next_version = next(versions)
-        next_version_def = repo_def[next_version]
 
-        # must be after build_configured_base_repo() so we dont set the
-        # default tag format in the pyproject.toml (we want semantic-release to use its defaults)
-        # however we need it to manually create the tags it knows how to parse
-        tag_format = tag_format_str or default_tag_format_str
-
-        with temporary_working_directory(repo_dir), Repo(".") as git_repo:
-            # commit initial files & update commit msg with sha & url
-            next_version_def["commits"] = simulate_change_commits_n_rtn_changelog_entry(
-                git_repo,
-                next_version_def["commits"],
-            )
-
-            main_branch_head = git_repo.heads[DEFAULT_BRANCH_NAME]
-
-            # write expected Markdown changelog to this version
-            simulate_default_changelog_creation(
-                repo_def,
-                hvcs=hvcs,
-                max_version=next_version,
-                dest_file=repo_dir.joinpath(changelog_md_file),
-                output_format=ChangelogOutputFormat.MARKDOWN,
-                mask_initial_release=mask_initial_release,
-            )
-
-            # write expected RST changelog to this version
-            simulate_default_changelog_creation(
-                repo_def,
-                hvcs=hvcs,
-                max_version=next_version,
-                dest_file=repo_dir.joinpath(changelog_rst_file),
-                output_format=ChangelogOutputFormat.RESTRUCTURED_TEXT,
-                mask_initial_release=mask_initial_release,
-            )
-
-            # Make initial release (v1.0.0)
-            create_release_tagged_commit(git_repo, next_version, tag_format)
-
-            # Increment version pointers & Save them for concurrent development simulation
-            patch_release_version = next(versions)
-            patch_release_version_def = repo_def[patch_release_version]
-
-            minor_release_version = next(versions)
-            minor_release_version_def = repo_def[minor_release_version]
-
-            # check out fix branch
-            fix_branch_head = git_repo.create_head(
-                FIX_BRANCH_1_NAME, main_branch_head.commit
-            )
-            fix_branch_head.checkout()
-
-            # Make a patch level commit
-            patch_release_version_def["commits"] = [
-                *simulate_change_commits_n_rtn_changelog_entry(
-                    # drop merge commit
-                    git_repo,
-                    patch_release_version_def["commits"][:1],
-                ),
-                # Add/Keep the merge message
-                patch_release_version_def["commits"][1],
+        repo_construction_steps.extend(
+            [
+                {
+                    "action": RepoActionStep.MAKE_COMMITS,
+                    "details": {
+                        "commits": convert_commit_specs_to_commit_defs(
+                            [
+                                {
+                                    "cid": (
+                                        cid_db_c1_initial := "db_c1_initial_commit"
+                                    ),
+                                    "conventional": INITIAL_COMMIT_MESSAGE,
+                                    "emoji": INITIAL_COMMIT_MESSAGE,
+                                    "scipy": INITIAL_COMMIT_MESSAGE,
+                                    "datetime": next(commit_timestamp_gen),
+                                    "include_in_changelog": bool(
+                                        commit_type == "emoji"
+                                    ),
+                                },
+                                {
+                                    "cid": (cid_db_c2_feat := "db_c2_feat"),
+                                    "conventional": "feat: add new feature",
+                                    "emoji": ":sparkles: add new feature",
+                                    "scipy": "ENH: add new feature",
+                                    "datetime": next(commit_timestamp_gen),
+                                    "include_in_changelog": True,
+                                },
+                            ],
+                            commit_type,
+                            parser=commit_parser,
+                        ),
+                    },
+                },
+                {
+                    "action": RepoActionStep.RELEASE,
+                    "details": {
+                        "version": str(new_version),
+                        "tag_format": new_version.tag_format,
+                        "datetime": next(commit_timestamp_gen),
+                        "pre_actions": [
+                            {
+                                "action": RepoActionStep.WRITE_CHANGELOGS,
+                                "details": {
+                                    "new_version": new_version,
+                                    "dest_files": changelog_file_definitions,
+                                    "commit_ids": [cid_db_c1_initial, cid_db_c2_feat],
+                                },
+                            },
+                        ],
+                    },
+                },
             ]
+        )
 
-            # check out feature branch
-            feat_branch_head = git_repo.create_head(
-                FEAT_BRANCH_1_NAME, main_branch_head.commit
-            )
-            feat_branch_head.checkout()
+        fix_branch_1_commits: Sequence[CommitSpec] = [
+            {
+                "cid": "fix_branch_c1",
+                "conventional": "fix(cli): add missing text\n\nResolves: #123\n",
+                "emoji": ":bug: add missing text\n\nResolves: #123\n",
+                "scipy": "MAINT: add missing text\n\nResolves: #123\n",
+                "datetime": next(commit_timestamp_gen),
+            },
+        ]
 
-            # Make 3 commits for a feature level bump (feat, test, docs)
-            minor_release_version_def["commits"] = [
-                *simulate_change_commits_n_rtn_changelog_entry(
-                    git_repo,
-                    minor_release_version_def["commits"][:3],
-                ),
-                # Add/Keep the merge message
-                minor_release_version_def["commits"][3],
+        repo_construction_steps.extend(
+            [
+                {
+                    "action": RepoActionStep.GIT_CHECKOUT,
+                    "details": {
+                        "create_branch": {
+                            "name": FIX_BRANCH_1_NAME,
+                            "start_branch": DEFAULT_BRANCH_NAME,
+                        }
+                    },
+                },
+                {
+                    "action": RepoActionStep.MAKE_COMMITS,
+                    "details": {
+                        "commits": convert_commit_specs_to_commit_defs(
+                            [
+                                {
+                                    **commit,
+                                    "include_in_changelog": False,
+                                }
+                                for commit in fix_branch_1_commits
+                            ],
+                            commit_type,
+                            parser=commit_parser,
+                        ),
+                    },
+                },
             ]
+        )
 
-            # check out main branch
-            main_branch_head.checkout()
+        # simulate separate work by another person at same time as the fix branch
+        feat_branch_1_commits: Sequence[CommitSpec] = [
+            {
+                "cid": "feat_branch_c1",
+                "conventional": "feat(cli): add cli interface",
+                "emoji": ":sparkles: add cli interface",
+                "scipy": "ENH: add cli interface",
+                "datetime": next(commit_timestamp_gen),
+            },
+            {
+                "cid": "feat_branch_c2",
+                "conventional": "test(cli): add cli tests",
+                "emoji": ":checkmark: add cli tests",
+                "scipy": "TST: add cli tests",
+                "datetime": next(commit_timestamp_gen),
+            },
+            {
+                "cid": "feat_branch_c3",
+                "conventional": "docs(cli): add cli documentation",
+                "emoji": ":memo: add cli documentation",
+                "scipy": "DOC: add cli documentation",
+                "datetime": next(commit_timestamp_gen),
+            },
+        ]
 
-            # Create Squash merge commit of fix branch into main (ignore conflicts & saving result)
-            patch_release_version_def["commits"][1] = create_squash_merge_commit(
-                git_repo=git_repo,
-                branch_name=fix_branch_head.name,
-                commit_def=patch_release_version_def["commits"][1],
+        repo_construction_steps.extend(
+            [
+                {
+                    "action": RepoActionStep.GIT_CHECKOUT,
+                    "details": {
+                        "create_branch": {
+                            "name": FEAT_BRANCH_1_NAME,
+                            "start_branch": DEFAULT_BRANCH_NAME,
+                        },
+                    },
+                },
+                {
+                    "action": RepoActionStep.MAKE_COMMITS,
+                    "details": {
+                        "commits": convert_commit_specs_to_commit_defs(
+                            [
+                                {
+                                    **commit,
+                                    "include_in_changelog": False,
+                                }
+                                for commit in feat_branch_1_commits
+                            ],
+                            commit_type,
+                            parser=commit_parser,
+                        )
+                    },
+                },
+            ]
+        )
+
+        new_version = Version.parse("1.0.1", tag_format=new_version.tag_format)
+
+        all_commit_types: list[CommitConvention] = ["conventional", "emoji", "scipy"]
+        fix_branch_pr_number = next(pr_num_gen)
+        cid_fix_branch_squash_base = "fix_branch_1_squash"
+        cid_fix_branch_squash_gen = (
+            f"{cid_fix_branch_squash_base}-{i}" for i in count(start=1)
+        )
+        fix_branch_squash_commit_spec: CommitSpec = {
+            **{  # type: ignore[typeddict-item]
+                cmt_type: format_squash_commit_msg_github(
+                    # Use the primary commit message as the PR title
+                    pr_title=fix_branch_1_commits[0][cmt_type],
+                    pr_number=fix_branch_pr_number,
+                    # No squashed commits since there is only one commit
+                    squashed_commits=[
+                        cmt[commit_type] for cmt in fix_branch_1_commits[1:]
+                    ],
+                )
+                for cmt_type in all_commit_types
+            },
+            "cid": cid_fix_branch_squash_base,
+            "datetime": next(commit_timestamp_gen),
+            "include_in_changelog": True,
+        }
+
+        repo_construction_steps.extend(
+            [
+                {
+                    "action": RepoActionStep.GIT_CHECKOUT,
+                    "details": {"branch": DEFAULT_BRANCH_NAME},
+                },
+                {
+                    "action": RepoActionStep.GIT_SQUASH,
+                    "details": {
+                        "branch": FIX_BRANCH_1_NAME,
+                        "strategy_option": "theirs",
+                        "commit_def": convert_commit_spec_to_commit_def(
+                            fix_branch_squash_commit_spec,
+                            commit_type,
+                            parser=commit_parser,
+                        ),
+                    },
+                },
+                {
+                    "action": RepoActionStep.RELEASE,
+                    "details": {
+                        "version": str(new_version),
+                        "tag_format": new_version.tag_format,
+                        "datetime": next(commit_timestamp_gen),
+                        "pre_actions": [
+                            {
+                                "action": RepoActionStep.WRITE_CHANGELOGS,
+                                "details": {
+                                    "new_version": new_version,
+                                    "dest_files": changelog_file_definitions,
+                                    "commit_ids": [
+                                        next(cid_fix_branch_squash_gen)
+                                        for _ in range(len(fix_branch_1_commits))
+                                    ],
+                                },
+                            },
+                        ],
+                    },
+                },
+            ]
+        )
+
+        feat_branch_pr_number = next(pr_num_gen)
+        cid_feat_branch_squash_base = "feat_branch_1_squash"
+        cid_feat_branch_squash_gen = (
+            f"{cid_feat_branch_squash_base}-{i}" for i in count(start=1)
+        )
+        feat_branch_squash_commit_spec: CommitSpec = {
+            **{  # type: ignore[typeddict-item]
+                cmt_type: format_squash_commit_msg_github(
+                    # Use the primary commit message as the PR title
+                    pr_title=feat_branch_1_commits[0][cmt_type],
+                    pr_number=feat_branch_pr_number,
+                    squashed_commits=[
+                        cmt[commit_type] for cmt in feat_branch_1_commits
+                    ],
+                )
+                for cmt_type in all_commit_types
+            },
+            "cid": cid_feat_branch_squash_base,
+            "datetime": next(commit_timestamp_gen),
+            "include_in_changelog": True,
+        }
+
+        new_version = Version.parse("1.1.0", tag_format=new_version.tag_format)
+
+        repo_construction_steps.extend(
+            [
+                {
+                    "action": RepoActionStep.GIT_SQUASH,
+                    "details": {
+                        "branch": FEAT_BRANCH_1_NAME,
+                        "strategy_option": "theirs",
+                        "commit_def": convert_commit_spec_to_commit_def(
+                            feat_branch_squash_commit_spec,
+                            commit_type,
+                            parser=commit_parser,
+                        ),
+                    },
+                },
+                {
+                    "action": RepoActionStep.RELEASE,
+                    "details": {
+                        "version": str(new_version),
+                        "tag_format": new_version.tag_format,
+                        "datetime": next(commit_timestamp_gen),
+                        "pre_actions": [
+                            {
+                                "action": RepoActionStep.WRITE_CHANGELOGS,
+                                "details": {
+                                    "new_version": new_version,
+                                    "dest_files": changelog_file_definitions,
+                                    "commit_ids": [
+                                        next(cid_feat_branch_squash_gen)
+                                        for _ in range(len(feat_branch_1_commits) + 1)
+                                    ],
+                                },
+                            },
+                        ],
+                    },
+                },
+            ]
+        )
+
+        return repo_construction_steps
+
+    return _get_repo_from_definition
+
+
+@pytest.fixture(scope="session")
+def build_repo_w_github_flow_w_default_release_channel(
+    build_repo_from_definition: BuildRepoFromDefinitionFn,
+    get_repo_definition_4_github_flow_repo_w_default_release_channel: GetRepoDefinitionFn,
+    get_cached_repo_data: GetCachedRepoDataFn,
+    build_repo_or_copy_cache: BuildRepoOrCopyCacheFn,
+    build_spec_hash_4_github_flow_repo_w_default_release_channel: str,
+) -> BuildSpecificRepoFn:
+    def _build_specific_repo_type(
+        repo_name: str, commit_type: CommitConvention, dest_dir: Path
+    ) -> Sequence[RepoActions]:
+        def _build_repo(cached_repo_path: Path) -> Sequence[RepoActions]:
+            repo_construction_steps = (
+                get_repo_definition_4_github_flow_repo_w_default_release_channel(
+                    commit_type=commit_type,
+                )
             )
+            return build_repo_from_definition(cached_repo_path, repo_construction_steps)
 
-            # write expected Markdown changelog to this version
-            simulate_default_changelog_creation(
-                repo_def,
-                hvcs=hvcs,
-                max_version=patch_release_version,
-                dest_file=repo_dir.joinpath(changelog_md_file),
-                output_format=ChangelogOutputFormat.MARKDOWN,
-                mask_initial_release=mask_initial_release,
-            )
+        build_repo_or_copy_cache(
+            repo_name=repo_name,
+            build_spec_hash=build_spec_hash_4_github_flow_repo_w_default_release_channel,
+            build_repo_func=_build_repo,
+            dest_dir=dest_dir,
+        )
 
-            # write expected RST changelog to this version
-            simulate_default_changelog_creation(
-                repo_def,
-                hvcs=hvcs,
-                max_version=patch_release_version,
-                dest_file=repo_dir.joinpath(changelog_rst_file),
-                output_format=ChangelogOutputFormat.RESTRUCTURED_TEXT,
-                mask_initial_release=mask_initial_release,
-            )
+        if not (cached_repo_data := get_cached_repo_data(proj_dirname=repo_name)):
+            raise ValueError("Failed to retrieve repo data from cache")
 
-            # Make patch release for fix (v1.0.1)
-            create_release_tagged_commit(git_repo, patch_release_version, tag_format)
+        return cached_repo_data["build_definition"]
 
-            # Create Squash merge commit of feature branch into main (ignore conflicts)
-            minor_release_version_def["commits"][3] = create_squash_merge_commit(
-                git_repo=git_repo,
-                branch_name=feat_branch_head.name,
-                commit_def=minor_release_version_def["commits"][3],
-            )
-
-            # write expected Markdown changelog to this version
-            simulate_default_changelog_creation(
-                repo_def,
-                hvcs=hvcs,
-                max_version=minor_release_version,
-                dest_file=repo_dir.joinpath(changelog_md_file),
-                output_format=ChangelogOutputFormat.MARKDOWN,
-                mask_initial_release=mask_initial_release,
-            )
-
-            # write expected RST changelog to this version
-            simulate_default_changelog_creation(
-                repo_def,
-                hvcs=hvcs,
-                max_version=minor_release_version,
-                dest_file=repo_dir.joinpath(changelog_rst_file),
-                output_format=ChangelogOutputFormat.RESTRUCTURED_TEXT,
-                mask_initial_release=mask_initial_release,
-            )
-
-            # Make minor release for feature (v1.1.1)
-            create_release_tagged_commit(git_repo, minor_release_version, tag_format)
-
-        return repo_dir, hvcs
-
-    return _build_github_flow_repo_w_default_release_channel
+    return _build_specific_repo_type
 
 
 # --------------------------------------------------------------------------- #
@@ -420,66 +496,62 @@ def build_github_flow_repo_w_default_release_channel(
 
 
 @pytest.fixture
-def repo_w_github_flow_w_default_release_channel_angular_commits(
-    build_repo_or_copy_cache: BuildRepoOrCopyCacheFn,
-    build_github_flow_repo_w_default_release_channel: BuildRepoFn,
-    build_spec_hash_for_github_flow_repo_w_default_release_channel: str,
+def repo_w_github_flow_w_default_release_channel_conventional_commits(
+    build_repo_w_github_flow_w_default_release_channel: BuildSpecificRepoFn,
     example_project_git_repo: ExProjectGitRepoFn,
     example_project_dir: ExProjectDir,
     change_to_ex_proj_dir: None,
-) -> Repo:
-    def _build_repo(cached_repo_path: Path):
-        build_github_flow_repo_w_default_release_channel(cached_repo_path, "angular")
-
-    build_repo_or_copy_cache(
-        repo_name=repo_w_github_flow_w_default_release_channel_angular_commits.__name__,
-        build_spec_hash=build_spec_hash_for_github_flow_repo_w_default_release_channel,
-        build_repo_func=_build_repo,
-        dest_dir=example_project_dir,
+) -> BuiltRepoResult:
+    repo_name = (
+        repo_w_github_flow_w_default_release_channel_conventional_commits.__name__
     )
+    commit_type: CommitConvention = repo_name.split("_")[-2]  # type: ignore[assignment]
 
-    return example_project_git_repo()
+    return {
+        "definition": build_repo_w_github_flow_w_default_release_channel(
+            repo_name=repo_name,
+            commit_type=commit_type,
+            dest_dir=example_project_dir,
+        ),
+        "repo": example_project_git_repo(),
+    }
 
 
 @pytest.fixture
 def repo_w_github_flow_w_default_release_channel_emoji_commits(
-    build_repo_or_copy_cache: BuildRepoOrCopyCacheFn,
-    build_github_flow_repo_w_default_release_channel: BuildRepoFn,
-    build_spec_hash_for_github_flow_repo_w_default_release_channel: str,
+    build_repo_w_github_flow_w_default_release_channel: BuildSpecificRepoFn,
     example_project_git_repo: ExProjectGitRepoFn,
     example_project_dir: ExProjectDir,
     change_to_ex_proj_dir: None,
-) -> Repo:
-    def _build_repo(cached_repo_path: Path):
-        build_github_flow_repo_w_default_release_channel(cached_repo_path, "emoji")
+) -> BuiltRepoResult:
+    repo_name = repo_w_github_flow_w_default_release_channel_emoji_commits.__name__
+    commit_type: CommitConvention = repo_name.split("_")[-2]  # type: ignore[assignment]
 
-    build_repo_or_copy_cache(
-        repo_name=repo_w_github_flow_w_default_release_channel_emoji_commits.__name__,
-        build_spec_hash=build_spec_hash_for_github_flow_repo_w_default_release_channel,
-        build_repo_func=_build_repo,
-        dest_dir=example_project_dir,
-    )
-
-    return example_project_git_repo()
+    return {
+        "definition": build_repo_w_github_flow_w_default_release_channel(
+            repo_name=repo_name,
+            commit_type=commit_type,
+            dest_dir=example_project_dir,
+        ),
+        "repo": example_project_git_repo(),
+    }
 
 
 @pytest.fixture
 def repo_w_github_flow_w_default_release_channel_scipy_commits(
-    build_repo_or_copy_cache: BuildRepoOrCopyCacheFn,
-    build_github_flow_repo_w_default_release_channel: BuildRepoFn,
-    build_spec_hash_for_github_flow_repo_w_default_release_channel: str,
+    build_repo_w_github_flow_w_default_release_channel: BuildSpecificRepoFn,
     example_project_git_repo: ExProjectGitRepoFn,
     example_project_dir: ExProjectDir,
     change_to_ex_proj_dir: None,
-) -> Repo:
-    def _build_repo(cached_repo_path: Path):
-        build_github_flow_repo_w_default_release_channel(cached_repo_path, "scipy")
+) -> BuiltRepoResult:
+    repo_name = repo_w_github_flow_w_default_release_channel_scipy_commits.__name__
+    commit_type: CommitConvention = repo_name.split("_")[-2]  # type: ignore[assignment]
 
-    build_repo_or_copy_cache(
-        repo_name=repo_w_github_flow_w_default_release_channel_scipy_commits.__name__,
-        build_spec_hash=build_spec_hash_for_github_flow_repo_w_default_release_channel,
-        build_repo_func=_build_repo,
-        dest_dir=example_project_dir,
-    )
-
-    return example_project_git_repo()
+    return {
+        "definition": build_repo_w_github_flow_w_default_release_channel(
+            repo_name=repo_name,
+            commit_type=commit_type,
+            dest_dir=example_project_dir,
+        ),
+        "repo": example_project_git_repo(),
+    }

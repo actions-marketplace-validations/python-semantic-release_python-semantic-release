@@ -15,12 +15,19 @@ from semantic_release.cli.cli_context import CliContextObj
 from semantic_release.cli.config import GlobalCommandLineOptions
 from semantic_release.cli.const import DEFAULT_CONFIG_FILE
 from semantic_release.cli.util import rprint
+from semantic_release.enums import SemanticReleaseLogLevels
 
 # if TYPE_CHECKING:
 #     pass
 
 
-FORMAT = "[%(module)s.%(funcName)s] %(message)s"
+FORMAT = "%(message)s"
+LOG_LEVELS = [
+    SemanticReleaseLogLevels.WARNING,
+    SemanticReleaseLogLevels.INFO,
+    SemanticReleaseLogLevels.DEBUG,
+    SemanticReleaseLogLevels.SILLY,
+]
 
 
 class Cli(click.MultiCommand):
@@ -78,7 +85,7 @@ class Cli(click.MultiCommand):
     default=0,
     count=True,
     show_default=True,
-    type=click.IntRange(0, 2, clamp=True),
+    type=click.IntRange(0, len(LOG_LEVELS) - 1, clamp=True),
 )
 @click.option(
     "--strict",
@@ -106,25 +113,21 @@ def main(
 
     For more information, visit https://python-semantic-release.readthedocs.io/
     """
-    console = Console(stderr=True)
+    globals.log_level = LOG_LEVELS[verbosity]
 
-    log_level = [logging.WARNING, logging.INFO, logging.DEBUG][verbosity]
-    logging.basicConfig(
-        level=log_level,
-        format=FORMAT,
-        datefmt="[%X]",
-        handlers=[
-            RichHandler(
-                console=console, rich_tracebacks=True, tracebacks_suppress=[click]
-            ),
-        ],
+    # Set up our pretty console formatter
+    rich_handler = RichHandler(
+        console=Console(stderr=True), rich_tracebacks=True, tracebacks_suppress=[click]
     )
+    rich_handler.setFormatter(logging.Formatter(FORMAT, datefmt="[%X]"))
 
-    logger = logging.getLogger(__name__)
-    logger.debug("logging level set to: %s", logging.getLevelName(log_level))
-
-    if log_level == logging.DEBUG:
-        globals.debug = True
+    # Set up logging with our pretty console formatter
+    logger = globals.logger
+    logger.handlers.clear()
+    logger.filters.clear()
+    logger.addHandler(rich_handler)
+    logger.setLevel(globals.log_level)
+    logger.debug("logging level set to: %s", logging.getLevelName(globals.log_level))
 
     if noop:
         rprint(

@@ -16,6 +16,10 @@ class InvalidConfiguration(SemanticReleaseBaseError):
     """Raised when configuration is deemed invalid"""
 
 
+class InvalidParserOptions(InvalidConfiguration):
+    """Raised when the parser options are invalid"""
+
+
 class MissingGitRemote(SemanticReleaseBaseError):
     """Raised when repository is missing the configured remote origin or upstream"""
 
@@ -102,3 +106,19 @@ class GitTagError(SemanticReleaseBaseError):
 
 class GitPushError(SemanticReleaseBaseError):
     """Raised when there is a failure to push to the git remote."""
+
+
+class GitFetchError(SemanticReleaseBaseError):
+    """Raised when there is a failure to fetch from the git remote."""
+
+
+class LocalGitError(SemanticReleaseBaseError):
+    """Raised when there is a failure with local git operations."""
+
+
+class UnknownUpstreamBranchError(SemanticReleaseBaseError):
+    """Raised when the upstream branch cannot be determined."""
+
+
+class UpstreamBranchChangedError(SemanticReleaseBaseError):
+    """Raised when the upstream branch has changed before pushing."""

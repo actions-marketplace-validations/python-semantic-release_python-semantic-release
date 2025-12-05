@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import pytest
+from pytest_lazy_fixtures.lazy_fixture import lf as lazy_fixture
 
 from semantic_release.cli.commands.changelog import changelog
 from semantic_release.cli.commands.generate_config import generate_config
@@ -11,14 +12,15 @@ from semantic_release.cli.commands.publish import publish
 from semantic_release.cli.commands.version import version
 
 from tests.const import MAIN_PROG_NAME, SUCCESS_EXIT_CODE
+from tests.fixtures.repos import repo_w_trunk_only_conventional_commits
 from tests.util import assert_exit_code
 
 if TYPE_CHECKING:
     from click import Command
-    from click.testing import CliRunner
-    from git import Repo
 
+    from tests.conftest import RunCliFn
     from tests.fixtures import UpdatePyprojectTomlFn
+    from tests.fixtures.git_repo import BuiltRepoResult
 
 
 # Define the expected exit code for the help command
@@ -36,7 +38,7 @@ HELP_EXIT_CODE = SUCCESS_EXIT_CODE
 def test_help_no_repo(
     help_option: str,
     command: Command,
-    cli_runner: CliRunner,
+    run_cli: RunCliFn,
     change_to_ex_proj_dir: None,
 ):
     """
@@ -67,7 +69,7 @@ def test_help_no_repo(
     )
 
     # Run the command with the help option
-    result = cli_runner.invoke(main, args, prog_name=MAIN_PROG_NAME)
+    result = run_cli(args, invoke_kwargs={"prog_name": MAIN_PROG_NAME})
 
     # Evaluate result
     assert_exit_code(HELP_EXIT_CODE, result, [MAIN_PROG_NAME, *args])
@@ -82,11 +84,11 @@ def test_help_no_repo(
     (main, changelog, generate_config, publish, version),
     ids=lambda cmd: cmd.name,
 )
+@pytest.mark.usefixtures(repo_w_trunk_only_conventional_commits.__name__)
 def test_help_valid_config(
     help_option: str,
     command: Command,
-    cli_runner: CliRunner,
-    repo_w_trunk_only_angular_commits: Repo,
+    run_cli: RunCliFn,
 ):
     """
     Test that the help message is displayed when the current directory is a git repository
@@ -115,7 +117,7 @@ def test_help_valid_config(
     )
 
     # Run the command with the help option
-    result = cli_runner.invoke(main, args, prog_name=MAIN_PROG_NAME)
+    result = run_cli(args, invoke_kwargs={"prog_name": MAIN_PROG_NAME})
 
     # Evaluate result
     assert_exit_code(HELP_EXIT_CODE, result, [MAIN_PROG_NAME, *args])
@@ -130,11 +132,11 @@ def test_help_valid_config(
     (main, changelog, generate_config, publish, version),
     ids=lambda cmd: cmd.name,
 )
+@pytest.mark.usefixtures(repo_w_trunk_only_conventional_commits.__name__)
 def test_help_invalid_config(
     help_option: str,
     command: Command,
-    cli_runner: CliRunner,
-    repo_w_trunk_only_angular_commits: Repo,
+    run_cli: RunCliFn,
     update_pyproject_toml: UpdatePyprojectTomlFn,
 ):
     """
@@ -168,7 +170,7 @@ def test_help_invalid_config(
     )
 
     # Run the command with the help option
-    result = cli_runner.invoke(main, args, prog_name=MAIN_PROG_NAME)
+    result = run_cli(args, invoke_kwargs={"prog_name": MAIN_PROG_NAME})
 
     # Evaluate result
     assert_exit_code(HELP_EXIT_CODE, result, [MAIN_PROG_NAME, *args])
@@ -183,19 +185,21 @@ def test_help_invalid_config(
     (main, changelog, generate_config, publish, version),
     ids=lambda cmd: cmd.name,
 )
+@pytest.mark.parametrize(
+    "repo_result", [lazy_fixture(repo_w_trunk_only_conventional_commits.__name__)]
+)
 def test_help_non_release_branch(
     help_option: str,
     command: Command,
-    cli_runner: CliRunner,
-    repo_w_trunk_only_angular_commits: Repo,
+    run_cli: RunCliFn,
+    repo_result: BuiltRepoResult,
 ):
     """
     Test that the help message is displayed even when the current branch is not a release branch.
     Documented issue #840
     """
     # Create & checkout a non-release branch
-    repo = repo_w_trunk_only_angular_commits
-    non_release_branch = repo.create_head("feature-branch")
+    non_release_branch = repo_result["repo"].create_head("feature-branch")
     non_release_branch.checkout()
 
     # Generate some expected output that should be specific per command
@@ -221,7 +225,7 @@ def test_help_non_release_branch(
     )
 
     # Run the command with the help option
-    result = cli_runner.invoke(main, args, prog_name=MAIN_PROG_NAME)
+    result = run_cli(args, invoke_kwargs={"prog_name": MAIN_PROG_NAME})
 
     # Evaluate result
     assert_exit_code(HELP_EXIT_CODE, result, [MAIN_PROG_NAME, *args])

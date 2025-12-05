@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 import warnings
 from abc import ABCMeta, abstractmethod
 from functools import lru_cache
@@ -12,10 +11,6 @@ from semantic_release.helpers import parse_git_url
 
 if TYPE_CHECKING:  # pragma: no cover
     from typing import Any, Callable
-
-
-# Globals
-logger = logging.getLogger(__name__)
 
 
 class HvcsBase(metaclass=ABCMeta):
@@ -30,7 +25,7 @@ class HvcsBase(metaclass=ABCMeta):
     """
 
     def __init__(self, remote_url: str, *args: Any, **kwargs: Any) -> None:
-        self._remote_url = remote_url
+        self._remote_url = remote_url if parse_git_url(remote_url) else ""
         self._name: str | None = None
         self._owner: str | None = None
 

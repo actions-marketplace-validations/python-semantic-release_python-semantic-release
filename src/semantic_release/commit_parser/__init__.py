@@ -6,6 +6,12 @@ from semantic_release.commit_parser.angular import (
     AngularCommitParser,
     AngularParserOptions,
 )
+from semantic_release.commit_parser.conventional import (
+    ConventionalCommitMonorepoParser,
+    ConventionalCommitMonorepoParserOptions,
+    ConventionalCommitParser,
+    ConventionalCommitParserOptions,
+)
 from semantic_release.commit_parser.emoji import (
     EmojiCommitParser,
     EmojiParserOptions,
@@ -24,3 +30,24 @@ from semantic_release.commit_parser.token import (
     ParseResult,
     ParseResultType,
 )
+
+__all__ = [
+    "CommitParser",
+    "ParserOptions",
+    "AngularCommitParser",
+    "AngularParserOptions",
+    "ConventionalCommitParser",
+    "ConventionalCommitParserOptions",
+    "ConventionalCommitMonorepoParser",
+    "ConventionalCommitMonorepoParserOptions",
+    "EmojiCommitParser",
+    "EmojiParserOptions",
+    "ScipyCommitParser",
+    "ScipyParserOptions",
+    "TagCommitParser",
+    "TagParserOptions",
+    "ParsedCommit",
+    "ParseError",
+    "ParseResult",
+    "ParseResultType",
+]

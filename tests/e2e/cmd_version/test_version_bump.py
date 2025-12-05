@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from datetime import timedelta
+from itertools import count
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import pytest
 import tomlkit
@@ -9,35 +11,35 @@ import tomlkit
 # Limitation in pytest-lazy-fixture - see https://stackoverflow.com/a/69884019
 from pytest_lazy_fixtures.lazy_fixture import lf as lazy_fixture
 
-from semantic_release.cli.commands.main import main
-from semantic_release.commit_parser.angular import AngularCommitParser
+from semantic_release.commit_parser.conventional import ConventionalCommitParser
 from semantic_release.commit_parser.emoji import EmojiCommitParser
 from semantic_release.commit_parser.scipy import ScipyCommitParser
 
 from tests.const import EXAMPLE_PROJECT_NAME, MAIN_PROG_NAME, VERSION_SUBCMD
 from tests.fixtures import (
-    angular_chore_commits,
-    angular_major_commits,
-    angular_minor_commits,
-    angular_patch_commits,
+    conventional_chore_commits,
+    conventional_major_commits,
+    conventional_minor_commits,
+    conventional_patch_commits,
     emoji_chore_commits,
     emoji_major_commits,
     emoji_minor_commits,
     emoji_patch_commits,
-    repo_w_git_flow_and_release_channels_angular_commits,
-    repo_w_git_flow_and_release_channels_emoji_commits,
-    repo_w_git_flow_and_release_channels_scipy_commits,
-    repo_w_git_flow_angular_commits,
-    repo_w_git_flow_emoji_commits,
-    repo_w_git_flow_scipy_commits,
-    repo_w_github_flow_w_feature_release_channel_angular_commits,
+    repo_w_git_flow_w_alpha_prereleases_n_conventional_commits,
+    repo_w_git_flow_w_alpha_prereleases_n_emoji_commits,
+    repo_w_git_flow_w_alpha_prereleases_n_scipy_commits,
+    repo_w_git_flow_w_rc_n_alpha_prereleases_n_conventional_commits,
+    repo_w_git_flow_w_rc_n_alpha_prereleases_n_emoji_commits,
+    repo_w_git_flow_w_rc_n_alpha_prereleases_n_scipy_commits,
+    repo_w_github_flow_w_feature_release_channel_conventional_commits,
     repo_w_initial_commit,
-    repo_w_no_tags_angular_commits,
+    repo_w_no_tags_conventional_commits,
+    repo_w_no_tags_conventional_commits_w_zero_version,
     repo_w_no_tags_emoji_commits,
     repo_w_no_tags_scipy_commits,
-    repo_w_trunk_only_angular_commits,
+    repo_w_trunk_only_conventional_commits,
     repo_w_trunk_only_emoji_commits,
-    repo_w_trunk_only_n_prereleases_angular_commits,
+    repo_w_trunk_only_n_prereleases_conventional_commits,
     repo_w_trunk_only_n_prereleases_emoji_commits,
     repo_w_trunk_only_n_prereleases_scipy_commits,
     repo_w_trunk_only_scipy_commits,
@@ -56,19 +58,25 @@ from tests.util import (
 if TYPE_CHECKING:
     from unittest.mock import MagicMock
 
-    from click.testing import CliRunner
-    from git import Repo
     from requests_mock import Mocker
 
-    from tests.fixtures.example_project import ExProjectDir, UpdatePyprojectTomlFn
+    from tests.conftest import GetStableDateNowFn, RunCliFn
+    from tests.fixtures.example_project import (
+        ExProjectDir,
+        GetExpectedVersionPyFileContentFn,
+        UpdatePyprojectTomlFn,
+    )
+    from tests.fixtures.git_repo import BuiltRepoResult
 
 
 @pytest.mark.parametrize(
-    "repo, cli_args, next_release_version",
+    "repo_result, cli_args, next_release_version",
     [
         *(
             (
-                lazy_fixture(repo_w_no_tags_angular_commits.__name__),
+                lazy_fixture(
+                    repo_w_no_tags_conventional_commits_w_zero_version.__name__
+                ),
                 cli_args,
                 next_release_version,
             )
@@ -115,7 +123,7 @@ if TYPE_CHECKING:
                 marks=pytest.mark.comprehensive,
             )
             for repo_fixture_name, values in {
-                repo_w_trunk_only_angular_commits.__name__: [
+                repo_w_trunk_only_conventional_commits.__name__: [
                     # New build-metadata forces a new release
                     (["--build-metadata", "build.12345"], "0.1.1+build.12345"),
                     # Forced version bump
@@ -152,7 +160,7 @@ if TYPE_CHECKING:
                         "0.1.2-beta.1+build.12345",
                     ),
                 ],
-                repo_w_trunk_only_n_prereleases_angular_commits.__name__: [
+                repo_w_trunk_only_n_prereleases_conventional_commits.__name__: [
                     # New build-metadata forces a new release
                     (["--build-metadata", "build.12345"], "0.2.0+build.12345"),
                     # Forced version bump
@@ -190,7 +198,7 @@ if TYPE_CHECKING:
                         "0.2.1-beta.1+build.12345",
                     ),
                 ],
-                repo_w_github_flow_w_feature_release_channel_angular_commits.__name__: [
+                repo_w_github_flow_w_feature_release_channel_conventional_commits.__name__: [
                     # New build-metadata forces a new release
                     (["--build-metadata", "build.12345"], "1.1.0+build.12345"),
                     # Forced version bump
@@ -227,7 +235,7 @@ if TYPE_CHECKING:
                         "1.1.1-beta.1+build.12345",
                     ),
                 ],
-                repo_w_git_flow_angular_commits.__name__: [
+                repo_w_git_flow_w_alpha_prereleases_n_conventional_commits.__name__: [
                     # New build-metadata forces a new release
                     (["--build-metadata", "build.12345"], "1.2.0-alpha.2+build.12345"),
                     # Forced version bump
@@ -264,7 +272,7 @@ if TYPE_CHECKING:
                         "1.2.1-beta.1+build.12345",
                     ),
                 ],
-                repo_w_git_flow_and_release_channels_angular_commits.__name__: [
+                repo_w_git_flow_w_rc_n_alpha_prereleases_n_conventional_commits.__name__: [
                     # New build-metadata forces a new release
                     (["--build-metadata", "build.12345"], "1.1.0+build.12345"),
                     # Forced version bump
@@ -307,48 +315,58 @@ if TYPE_CHECKING:
     ],
 )
 def test_version_force_level(
-    repo: Repo,
+    repo_result: BuiltRepoResult,
     cli_args: list[str],
     next_release_version: str,
     example_project_dir: ExProjectDir,
     example_pyproject_toml: Path,
-    cli_runner: CliRunner,
+    run_cli: RunCliFn,
+    mocked_git_fetch: MagicMock,
     mocked_git_push: MagicMock,
     post_mocker: Mocker,
+    pyproject_toml_file: Path,
+    changelog_md_file: Path,
+    get_expected_version_py_file_content: GetExpectedVersionPyFileContentFn,
 ):
+    # Force clean directory state before test (needed for the repo_w_no_tags)
+    repo = repo_result["repo"]
+    repo.git.reset("HEAD", hard=True)
+
     version_file = example_project_dir.joinpath(
         "src", EXAMPLE_PROJECT_NAME, "_version.py"
     )
+
     expected_changed_files = sorted(
         [
-            "CHANGELOG.md",
-            "pyproject.toml",
+            str(changelog_md_file),
+            str(pyproject_toml_file),
             str(version_file.relative_to(example_project_dir)),
         ]
+    )
+
+    expected_version_py_content = get_expected_version_py_file_content(
+        next_release_version
     )
 
     # Setup: take measurement before running the version command
     head_sha_before = repo.head.commit.hexsha
     tags_before = {tag.name for tag in repo.tags}
-    version_py_before = dynamic_python_import(
-        version_file, f"{EXAMPLE_PROJECT_NAME}._version"
-    ).__version__
 
     pyproject_toml_before = tomlkit.loads(
         example_pyproject_toml.read_text(encoding="utf-8")
     )
 
     # Modify the pyproject.toml to remove the version so we can compare it later
-    pyproject_toml_before["tool"]["poetry"].pop("version")  # type: ignore[attr-defined]
+    pyproject_toml_before.get("tool", {}).get("poetry").pop("version")  # type: ignore[attr-defined]
 
     # Act
     cli_cmd = [MAIN_PROG_NAME, VERSION_SUBCMD, *cli_args]
-    result = cli_runner.invoke(main, cli_cmd[1:])
+    result = run_cli(cli_cmd[1:])
 
     # take measurement after running the version command
     head_after = repo.head.commit
     tags_after = {tag.name for tag in repo.tags}
-    tags_set_difference = set.difference(tags_after, tags_before)
+    tags_set_difference = cast("set[str]", set.difference(tags_after, tags_before))
     differing_files = [
         # Make sure filepath uses os specific path separators
         str(Path(file))
@@ -357,14 +375,12 @@ def test_version_force_level(
     pyproject_toml_after = tomlkit.loads(
         example_pyproject_toml.read_text(encoding="utf-8")
     )
-    pyproj_version_after = pyproject_toml_after["tool"]["poetry"].pop(  # type: ignore[attr-defined]
-        "version"
+    pyproj_version_after = (
+        pyproject_toml_after.get("tool", {}).get("poetry", {}).pop("version")
     )
 
     # Load python module for reading the version (ensures the file is valid)
-    version_py_after = dynamic_python_import(
-        version_file, f"{EXAMPLE_PROJECT_NAME}._version"
-    ).__version__
+    actual_version_py_content = version_file.read_text()
 
     # Evaluate (normal release actions should have occurred when forced patch bump)
     assert_successful_exit_code(result, cli_cmd)
@@ -375,6 +391,7 @@ def test_version_force_level(
     assert len(tags_set_difference) == 1  # A tag has been created
     assert f"v{next_release_version}" in tags_set_difference
 
+    assert mocked_git_fetch.call_count == 1  # fetch called to check for remote changes
     assert mocked_git_push.call_count == 2  # 1 for commit, 1 for tag
     assert post_mocker.call_count == 1  # vcs release creation occurred
 
@@ -386,8 +403,14 @@ def test_version_force_level(
     assert next_release_version == pyproj_version_after
 
     # Compare _version.py
-    assert next_release_version == version_py_after
-    assert version_py_before != version_py_after
+    assert expected_version_py_content == actual_version_py_content
+
+    # Verify content is parsable & importable
+    dynamic_version = dynamic_python_import(
+        version_file, f"{EXAMPLE_PROJECT_NAME}._version"
+    ).__version__
+
+    assert next_release_version == dynamic_version
 
 
 # NOTE: There is a bit of a corner-case where if we are not doing a
@@ -403,7 +426,7 @@ def test_version_force_level(
     str.join(
         ", ",
         [
-            "repo",
+            "repo_result",
             "commit_messages",
             "prerelease",
             "prerelease_token",
@@ -416,8 +439,10 @@ def test_version_force_level(
             (
                 # Default case should be a minor bump since last full release was 1.1.1
                 # last tag is a prerelease 1.2.0-rc.2
-                lazy_fixture(repo_w_git_flow_angular_commits.__name__),
-                lazy_fixture(angular_minor_commits.__name__),
+                lazy_fixture(
+                    repo_w_git_flow_w_alpha_prereleases_n_conventional_commits.__name__
+                ),
+                lazy_fixture(conventional_minor_commits.__name__),
                 False,
                 "alpha",
                 "1.2.0",
@@ -438,25 +463,25 @@ def test_version_force_level(
                     # The last full release version was 1.1.1, so it's had a minor
                     # prerelease
                     (
-                        repo_w_git_flow_angular_commits.__name__,
+                        repo_w_git_flow_w_alpha_prereleases_n_conventional_commits.__name__,
                         "alpha",
                     ): [
-                        (angular_patch_commits.__name__, False, "1.1.2", None),
+                        (conventional_patch_commits.__name__, False, "1.1.2", None),
                         (
-                            angular_patch_commits.__name__,
+                            conventional_patch_commits.__name__,
                             True,
                             "1.1.2-alpha.1",
                             None,
                         ),
                         (
-                            angular_minor_commits.__name__,
+                            conventional_minor_commits.__name__,
                             True,
                             "1.2.0-alpha.3",
-                            "feat/feature-3",  # branch
+                            "feat/feature-4",  # branch
                         ),
-                        (angular_major_commits.__name__, False, "2.0.0", None),
+                        (conventional_major_commits.__name__, False, "2.0.0", None),
                         (
-                            angular_major_commits.__name__,
+                            conventional_major_commits.__name__,
                             True,
                             "2.0.0-alpha.1",
                             None,
@@ -465,26 +490,26 @@ def test_version_force_level(
                     # Latest version for repo_with_git_flow_and_release_channels is
                     # currently 1.1.0
                     (
-                        repo_w_git_flow_and_release_channels_angular_commits.__name__,
+                        repo_w_git_flow_w_rc_n_alpha_prereleases_n_conventional_commits.__name__,
                         "alpha",
                     ): [
-                        (angular_patch_commits.__name__, False, "1.1.1", None),
+                        (conventional_patch_commits.__name__, False, "1.1.1", None),
                         (
-                            angular_patch_commits.__name__,
+                            conventional_patch_commits.__name__,
                             True,
                             "1.1.1-alpha.1",
                             None,
                         ),
-                        (angular_minor_commits.__name__, False, "1.2.0", None),
+                        (conventional_minor_commits.__name__, False, "1.2.0", None),
                         (
-                            angular_minor_commits.__name__,
+                            conventional_minor_commits.__name__,
                             True,
                             "1.2.0-alpha.1",
                             None,
                         ),
-                        (angular_major_commits.__name__, False, "2.0.0", None),
+                        (conventional_major_commits.__name__, False, "2.0.0", None),
                         (
-                            angular_major_commits.__name__,
+                            conventional_major_commits.__name__,
                             True,
                             "2.0.0-alpha.1",
                             None,
@@ -496,32 +521,46 @@ def test_version_force_level(
                     prerelease,
                     expected_new_version,
                     branch_name,
-                ) in values
+                ) in values  # type: ignore[attr-defined]
             ],
         ]
     ),
 )
 # TODO: add a github flow test case
-def test_version_next_greater_than_version_one_angular(
-    repo: Repo,
+def test_version_next_greater_than_version_one_conventional(
+    repo_result: BuiltRepoResult,
     commit_messages: list[str],
     prerelease: bool,
     prerelease_token: str,
     next_release_version: str,
     branch_name: str,
-    cli_runner: CliRunner,
+    run_cli: RunCliFn,
     file_in_repo: str,
+    mocked_git_fetch: MagicMock,
     mocked_git_push: MagicMock,
     post_mocker: Mocker,
+    stable_now_date: GetStableDateNowFn,
 ):
+    repo = repo_result["repo"]
+
     # setup: select the branch we desire for the next bump
     if repo.active_branch.name != branch_name:
         repo.heads[branch_name].checkout()
 
     # setup: apply commits to the repo
+    stable_now_datetime = stable_now_date()
+    commit_timestamp_gen = (
+        (stable_now_datetime + timedelta(seconds=i)).isoformat(timespec="seconds")
+        for i in count(step=1)
+    )
     for commit_message in commit_messages or []:
         add_text_to_file(repo, file_in_repo)
-        repo.git.commit(m=commit_message, a=True)
+        repo.git.commit(m=commit_message, a=True, date=next(commit_timestamp_gen))
+        # Fake an automated push to remote by updating the remote tracking branch
+        repo.git.update_ref(
+            f"refs/remotes/origin/{repo.active_branch.name}",
+            repo.head.commit.hexsha,
+        )
 
     # Setup: take measurement before running the version command
     head_sha_before = repo.head.commit.hexsha
@@ -540,12 +579,12 @@ def test_version_next_greater_than_version_one_angular(
 
     # Act
     cli_cmd = [MAIN_PROG_NAME, VERSION_SUBCMD, *prerelease_args]
-    result = cli_runner.invoke(main, cli_cmd[1:])
+    result = run_cli(cli_cmd[1:])
 
     # take measurement after running the version command
     head_after = repo.head.commit
     tags_after = {tag.name for tag in repo.tags}
-    tags_set_difference = set.difference(tags_after, tags_before)
+    tags_set_difference = cast("set[str]", set.difference(tags_after, tags_before))
 
     # Evaluate (normal release actions should have occurred when forced patch bump)
     assert_successful_exit_code(result, cli_cmd)
@@ -556,6 +595,7 @@ def test_version_next_greater_than_version_one_angular(
     assert len(tags_set_difference) == 1  # A tag has been created
     assert f"v{next_release_version}" in tags_set_difference
 
+    assert mocked_git_fetch.call_count == 1  # fetch called to check for remote changes
     assert mocked_git_push.call_count == 2  # 1 for commit, 1 for tag
     assert post_mocker.call_count == 1  # vcs release creation occurred
 
@@ -564,7 +604,7 @@ def test_version_next_greater_than_version_one_angular(
     str.join(
         ", ",
         [
-            "repo",
+            "repo_result",
             "commit_messages",
             "prerelease",
             "prerelease_token",
@@ -589,28 +629,28 @@ def test_version_next_greater_than_version_one_angular(
                     # The last full release version was 1.1.1, so it's had a minor
                     # prerelease
                     (
-                        repo_w_git_flow_angular_commits.__name__,
+                        repo_w_git_flow_w_alpha_prereleases_n_conventional_commits.__name__,
                         "alpha",
                     ): [
                         *(
-                            (commits, True, "1.2.0-alpha.2", "feat/feature-3")
+                            (commits, True, "1.2.0-alpha.2", "feat/feature-4")
                             for commits in (
                                 None,
-                                angular_chore_commits.__name__,
+                                conventional_chore_commits.__name__,
                             )
                         ),
                         *(
                             (commits, False, "1.1.1", None)
                             for commits in (
                                 None,
-                                angular_chore_commits.__name__,
+                                conventional_chore_commits.__name__,
                             )
                         ),
                     ],
                     # Latest version for repo_with_git_flow_and_release_channels is
                     # currently 1.1.0
                     (
-                        repo_w_git_flow_and_release_channels_angular_commits.__name__,
+                        repo_w_git_flow_w_rc_n_alpha_prereleases_n_conventional_commits.__name__,
                         "alpha",
                     ): [
                         *(
@@ -618,7 +658,7 @@ def test_version_next_greater_than_version_one_angular(
                             for prerelease in (True, False)
                             for commits in (
                                 None,
-                                angular_chore_commits.__name__,
+                                conventional_chore_commits.__name__,
                             )
                         ),
                     ],
@@ -628,31 +668,45 @@ def test_version_next_greater_than_version_one_angular(
                     prerelease,
                     expected_new_version,
                     branch_name,
-                ) in values
+                ) in values  # type: ignore[attr-defined]
             ],
         ]
     ),
 )
-def test_version_next_greater_than_version_one_no_bump_angular(
-    repo: Repo,
+def test_version_next_greater_than_version_one_no_bump_conventional(
+    repo_result: BuiltRepoResult,
     commit_messages: list[str],
     prerelease: bool,
     prerelease_token: str,
     next_release_version: str,
     branch_name: str,
-    cli_runner: CliRunner,
+    run_cli: RunCliFn,
     file_in_repo: str,
+    mocked_git_fetch: MagicMock,
     mocked_git_push: MagicMock,
     post_mocker: Mocker,
+    stable_now_date: GetStableDateNowFn,
 ):
+    repo = repo_result["repo"]
+
     # setup: select the branch we desire for the next bump
     if repo.active_branch.name != branch_name:
         repo.heads[branch_name].checkout()
 
     # setup: apply commits to the repo
+    stable_now_datetime = stable_now_date()
+    commit_timestamp_gen = (
+        (stable_now_datetime + timedelta(seconds=i)).isoformat(timespec="seconds")
+        for i in count(step=1)
+    )
     for commit_message in commit_messages or []:
         add_text_to_file(repo, file_in_repo)
-        repo.git.commit(m=commit_message, a=True)
+        repo.git.commit(m=commit_message, a=True, date=next(commit_timestamp_gen))
+        # Fake an automated push to remote by updating the remote tracking branch
+        repo.git.update_ref(
+            f"refs/remotes/origin/{repo.active_branch.name}",
+            repo.head.commit.hexsha,
+        )
 
     # Setup: take measurement before running the version command
     head_sha_before = repo.head.commit.hexsha
@@ -671,12 +725,12 @@ def test_version_next_greater_than_version_one_no_bump_angular(
 
     # Act
     cli_cmd = [MAIN_PROG_NAME, VERSION_SUBCMD, *prerelease_args]
-    result = cli_runner.invoke(main, cli_cmd[1:])
+    result = run_cli(cli_cmd[1:])
 
     # take measurement after running the version command
     head_after = repo.head.commit
     tags_after = {tag.name for tag in repo.tags}
-    tags_set_difference = set.difference(tags_after, tags_before)
+    tags_set_difference = cast("set[str]", set.difference(tags_after, tags_before))
 
     # Evaluate (no release actions should have occurred when no bump)
     assert_successful_exit_code(result, cli_cmd)
@@ -685,6 +739,7 @@ def test_version_next_greater_than_version_one_no_bump_angular(
     # No commit has been made
     assert head_sha_before == head_after.hexsha
     assert len(tags_set_difference) == 0  # No tag created
+    assert mocked_git_fetch.call_count == 0  # no git fetch called
     assert mocked_git_push.call_count == 0  # no git push of tag or commit
     assert post_mocker.call_count == 0  # no vcs release
 
@@ -693,7 +748,7 @@ def test_version_next_greater_than_version_one_no_bump_angular(
     str.join(
         ", ",
         [
-            "repo",
+            "repo_result",
             "commit_messages",
             "prerelease",
             "prerelease_token",
@@ -703,114 +758,122 @@ def test_version_next_greater_than_version_one_no_bump_angular(
     ),
     xdist_sort_hack(
         [
-            (
-                # Default case should be a minor bump since last full release was 1.1.1
-                # last tag is a prerelease 1.2.0-rc.2
-                lazy_fixture(repo_w_git_flow_emoji_commits.__name__),
-                lazy_fixture(emoji_minor_commits.__name__),
-                False,
-                "alpha",
-                "1.2.0",
-                "main",
-            ),
-            *[
-                pytest.param(
-                    lazy_fixture(repo_fixture_name),
-                    [] if commit_messages is None else lazy_fixture(commit_messages),
-                    prerelease,
-                    prerelease_token,
-                    expected_new_version,
-                    "main" if branch_name is None else branch_name,
-                    marks=pytest.mark.comprehensive,
-                )
-                for (repo_fixture_name, prerelease_token), values in {
-                    # Latest version for repo_with_git_flow is currently 1.2.0-alpha.2
-                    # The last full release version was 1.1.1, so it's had a minor
-                    # prerelease
+            pytest.param(
+                lazy_fixture(repo_fixture_name),
+                [] if commit_messages is None else lazy_fixture(commit_messages),
+                prerelease,
+                prerelease_token,
+                expected_new_version,
+                "main" if branch_name is None else branch_name,
+                marks=pytest.mark.comprehensive,
+            )
+            for (repo_fixture_name, prerelease_token), values in {
+                # Latest version for repo_with_git_flow is currently 1.2.0-alpha.2
+                # The last full release version was 1.1.1, so it's had a minor
+                # prerelease
+                (
+                    repo_w_git_flow_w_alpha_prereleases_n_emoji_commits.__name__,
+                    "alpha",
+                ): [
+                    (emoji_patch_commits.__name__, False, "1.1.2", None),
                     (
-                        repo_w_git_flow_emoji_commits.__name__,
-                        "alpha",
-                    ): [
-                        (emoji_patch_commits.__name__, False, "1.1.2", None),
-                        (
-                            emoji_patch_commits.__name__,
-                            True,
-                            "1.1.2-alpha.1",
-                            None,
-                        ),
-                        (
-                            emoji_minor_commits.__name__,
-                            True,
-                            "1.2.0-alpha.3",
-                            "feat/feature-3",  # branch
-                        ),
-                        (emoji_major_commits.__name__, False, "2.0.0", None),
-                        (
-                            emoji_major_commits.__name__,
-                            True,
-                            "2.0.0-alpha.1",
-                            None,
-                        ),
-                    ],
-                    # Latest version for repo_with_git_flow_and_release_channels is
-                    # currently 1.1.0
+                        emoji_patch_commits.__name__,
+                        True,
+                        "1.1.2-alpha.1",
+                        None,
+                    ),
                     (
-                        repo_w_git_flow_and_release_channels_emoji_commits.__name__,
-                        "alpha",
-                    ): [
-                        (emoji_patch_commits.__name__, False, "1.1.1", None),
-                        (
-                            emoji_patch_commits.__name__,
-                            True,
-                            "1.1.1-alpha.1",
-                            None,
-                        ),
-                        (emoji_minor_commits.__name__, False, "1.2.0", None),
-                        (
-                            emoji_minor_commits.__name__,
-                            True,
-                            "1.2.0-alpha.1",
-                            None,
-                        ),
-                        (emoji_major_commits.__name__, False, "2.0.0", None),
-                        (
-                            emoji_major_commits.__name__,
-                            True,
-                            "2.0.0-alpha.1",
-                            None,
-                        ),
-                    ],
-                }.items()
-                for (
-                    commit_messages,
-                    prerelease,
-                    expected_new_version,
-                    branch_name,
-                ) in values
-            ],
+                        emoji_minor_commits.__name__,
+                        False,
+                        "1.2.0",
+                        None,
+                    ),
+                    (
+                        emoji_minor_commits.__name__,
+                        True,
+                        "1.2.0-alpha.3",
+                        "feat/feature-4",  # branch
+                    ),
+                    (emoji_major_commits.__name__, False, "2.0.0", None),
+                    (
+                        emoji_major_commits.__name__,
+                        True,
+                        "2.0.0-alpha.1",
+                        None,
+                    ),
+                ],
+                # Latest version for repo_with_git_flow_and_release_channels is
+                # currently 1.1.0
+                (
+                    repo_w_git_flow_w_rc_n_alpha_prereleases_n_emoji_commits.__name__,
+                    "alpha",
+                ): [
+                    (emoji_patch_commits.__name__, False, "1.1.1", None),
+                    (
+                        emoji_patch_commits.__name__,
+                        True,
+                        "1.1.1-alpha.1",
+                        None,
+                    ),
+                    (emoji_minor_commits.__name__, False, "1.2.0", None),
+                    (
+                        emoji_minor_commits.__name__,
+                        True,
+                        "1.2.0-alpha.1",
+                        None,
+                    ),
+                    (emoji_major_commits.__name__, False, "2.0.0", None),
+                    (
+                        emoji_major_commits.__name__,
+                        True,
+                        "2.0.0-alpha.1",
+                        None,
+                    ),
+                ],
+            }.items()
+            for (
+                commit_messages,
+                prerelease,
+                expected_new_version,
+                branch_name,
+            ) in values  # type: ignore[attr-defined]
         ]
     ),
 )
 def test_version_next_greater_than_version_one_emoji(
-    repo: Repo,
+    repo_result: BuiltRepoResult,
     commit_messages: list[str],
     prerelease: bool,
     prerelease_token: str,
     next_release_version: str,
     branch_name: str,
-    cli_runner: CliRunner,
+    run_cli: RunCliFn,
     file_in_repo: str,
+    mocked_git_fetch: MagicMock,
     mocked_git_push: MagicMock,
     post_mocker: Mocker,
+    stable_now_date: GetStableDateNowFn,
 ):
+    repo = repo_result["repo"]
+
     # setup: select the branch we desire for the next bump
     if repo.active_branch.name != branch_name:
         repo.heads[branch_name].checkout()
 
     # setup: apply commits to the repo
+    stable_now_datetime = stable_now_date()
+    commit_timestamp_gen = (
+        (stable_now_datetime + timedelta(seconds=i)).isoformat(timespec="seconds")
+        for i in count(step=1)
+    )
     for commit_message in commit_messages or []:
         add_text_to_file(repo, file_in_repo)
-        repo.git.commit(m=commit_message, a=True)
+        repo.git.commit(m=commit_message, a=True, date=next(commit_timestamp_gen))
+        # Fake an automated push to remote by updating the remote tracking branch
+        repo.git.update_ref(
+            f"refs/remotes/origin/{repo.active_branch.name}",
+            repo.head.commit.hexsha,
+        )
 
     # Setup: take measurement before running the version command
     head_sha_before = repo.head.commit.hexsha
@@ -829,12 +892,12 @@ def test_version_next_greater_than_version_one_emoji(
 
     # Act
     cli_cmd = [MAIN_PROG_NAME, VERSION_SUBCMD, *prerelease_args]
-    result = cli_runner.invoke(main, cli_cmd[1:])
+    result = run_cli(cli_cmd[1:])
 
     # take measurement after running the version command
     head_after = repo.head.commit
     tags_after = {tag.name for tag in repo.tags}
-    tags_set_difference = set.difference(tags_after, tags_before)
+    tags_set_difference = cast("set[str]", set.difference(tags_after, tags_before))
 
     # Evaluate (normal release actions should have occurred when forced patch bump)
     assert_successful_exit_code(result, cli_cmd)
@@ -845,6 +908,7 @@ def test_version_next_greater_than_version_one_emoji(
     assert len(tags_set_difference) == 1  # A tag has been created
     assert f"v{next_release_version}" in tags_set_difference
 
+    assert mocked_git_fetch.call_count == 1  # fetch called to check for remote changes
     assert mocked_git_push.call_count == 2  # 1 for commit, 1 for tag
     assert post_mocker.call_count == 1  # vcs release creation occurred
 
@@ -853,7 +917,7 @@ def test_version_next_greater_than_version_one_emoji(
     str.join(
         ", ",
         [
-            "repo",
+            "repo_result",
             "commit_messages",
             "prerelease",
             "prerelease_token",
@@ -878,11 +942,11 @@ def test_version_next_greater_than_version_one_emoji(
                     # The last full release version was 1.1.1, so it's had a minor
                     # prerelease
                     (
-                        repo_w_git_flow_emoji_commits.__name__,
+                        repo_w_git_flow_w_alpha_prereleases_n_emoji_commits.__name__,
                         "alpha",
                     ): [
                         *(
-                            (commits, True, "1.2.0-alpha.2", "feat/feature-3")
+                            (commits, True, "1.2.0-alpha.2", "feat/feature-4")
                             for commits in (
                                 None,
                                 emoji_chore_commits.__name__,
@@ -899,7 +963,7 @@ def test_version_next_greater_than_version_one_emoji(
                     # Latest version for repo_with_git_flow_and_release_channels is
                     # currently 1.1.0
                     (
-                        repo_w_git_flow_and_release_channels_emoji_commits.__name__,
+                        repo_w_git_flow_w_rc_n_alpha_prereleases_n_emoji_commits.__name__,
                         "alpha",
                     ): [
                         *(
@@ -917,31 +981,45 @@ def test_version_next_greater_than_version_one_emoji(
                     prerelease,
                     expected_new_version,
                     branch_name,
-                ) in values
+                ) in values  # type: ignore[attr-defined]
             ],
         ]
     ),
 )
 def test_version_next_greater_than_version_one_no_bump_emoji(
-    repo: Repo,
+    repo_result: BuiltRepoResult,
     commit_messages: list[str],
     prerelease: bool,
     prerelease_token: str,
     next_release_version: str,
     branch_name: str,
-    cli_runner: CliRunner,
+    run_cli: RunCliFn,
     file_in_repo: str,
+    mocked_git_fetch: MagicMock,
     mocked_git_push: MagicMock,
     post_mocker: Mocker,
+    stable_now_date: GetStableDateNowFn,
 ):
+    repo = repo_result["repo"]
+
     # setup: select the branch we desire for the next bump
     if repo.active_branch.name != branch_name:
         repo.heads[branch_name].checkout()
 
     # setup: apply commits to the repo
+    stable_now_datetime = stable_now_date()
+    commit_timestamp_gen = (
+        (stable_now_datetime + timedelta(seconds=i)).isoformat(timespec="seconds")
+        for i in count(step=1)
+    )
     for commit_message in commit_messages or []:
         add_text_to_file(repo, file_in_repo)
-        repo.git.commit(m=commit_message, a=True)
+        repo.git.commit(m=commit_message, a=True, date=next(commit_timestamp_gen))
+        # Fake an automated push to remote by updating the remote tracking branch
+        repo.git.update_ref(
+            f"refs/remotes/origin/{repo.active_branch.name}",
+            repo.head.commit.hexsha,
+        )
 
     # Setup: take measurement before running the version command
     head_sha_before = repo.head.commit.hexsha
@@ -960,12 +1038,12 @@ def test_version_next_greater_than_version_one_no_bump_emoji(
 
     # Act
     cli_cmd = [MAIN_PROG_NAME, VERSION_SUBCMD, *prerelease_args]
-    result = cli_runner.invoke(main, cli_cmd[1:])
+    result = run_cli(cli_cmd[1:])
 
     # take measurement after running the version command
     head_after = repo.head.commit
     tags_after = {tag.name for tag in repo.tags}
-    tags_set_difference = set.difference(tags_after, tags_before)
+    tags_set_difference = cast("set[str]", set.difference(tags_after, tags_before))
 
     # Evaluate (normal release actions should have occurred when forced patch bump)
     assert_successful_exit_code(result, cli_cmd)
@@ -974,6 +1052,7 @@ def test_version_next_greater_than_version_one_no_bump_emoji(
     # No commit has been made
     assert head_sha_before == head_after.hexsha
     assert len(tags_set_difference) == 0  # No tag created
+    assert mocked_git_fetch.call_count == 0  # no git fetch called
     assert mocked_git_push.call_count == 0  # no git push of tag or commit
     assert post_mocker.call_count == 0  # no vcs release
 
@@ -982,7 +1061,7 @@ def test_version_next_greater_than_version_one_no_bump_emoji(
     str.join(
         ", ",
         [
-            "repo",
+            "repo_result",
             "commit_messages",
             "prerelease",
             "prerelease_token",
@@ -992,114 +1071,122 @@ def test_version_next_greater_than_version_one_no_bump_emoji(
     ),
     xdist_sort_hack(
         [
-            (
-                # Default case should be a minor bump since last full release was 1.1.1
-                # last tag is a prerelease 1.2.0-rc.2
-                lazy_fixture(repo_w_git_flow_scipy_commits.__name__),
-                lazy_fixture(scipy_minor_commits.__name__),
-                False,
-                "alpha",
-                "1.2.0",
-                "main",
-            ),
-            *[
-                pytest.param(
-                    lazy_fixture(repo_fixture_name),
-                    [] if commit_messages is None else lazy_fixture(commit_messages),
-                    prerelease,
-                    prerelease_token,
-                    expected_new_version,
-                    "main" if branch_name is None else branch_name,
-                    marks=pytest.mark.comprehensive,
-                )
-                for (repo_fixture_name, prerelease_token), values in {
-                    # Latest version for repo_with_git_flow is currently 1.2.0-alpha.2
-                    # The last full release version was 1.1.1, so it's had a minor
-                    # prerelease
+            pytest.param(
+                lazy_fixture(repo_fixture_name),
+                [] if commit_messages is None else lazy_fixture(commit_messages),
+                prerelease,
+                prerelease_token,
+                expected_new_version,
+                "main" if branch_name is None else branch_name,
+                marks=pytest.mark.comprehensive,
+            )
+            for (repo_fixture_name, prerelease_token), values in {
+                # Latest version for repo_with_git_flow is currently 1.2.0-alpha.2
+                # The last full release version was 1.1.1, so it's had a minor
+                # prerelease
+                (
+                    repo_w_git_flow_w_alpha_prereleases_n_scipy_commits.__name__,
+                    "alpha",
+                ): [
+                    (scipy_patch_commits.__name__, False, "1.1.2", None),
                     (
-                        repo_w_git_flow_scipy_commits.__name__,
-                        "alpha",
-                    ): [
-                        (scipy_patch_commits.__name__, False, "1.1.2", None),
-                        (
-                            scipy_patch_commits.__name__,
-                            True,
-                            "1.1.2-alpha.1",
-                            None,
-                        ),
-                        (
-                            scipy_minor_commits.__name__,
-                            True,
-                            "1.2.0-alpha.3",
-                            "feat/feature-3",  # branch
-                        ),
-                        (scipy_major_commits.__name__, False, "2.0.0", None),
-                        (
-                            scipy_major_commits.__name__,
-                            True,
-                            "2.0.0-alpha.1",
-                            None,
-                        ),
-                    ],
-                    # Latest version for repo_with_git_flow_and_release_channels is
-                    # currently 1.1.0
+                        scipy_patch_commits.__name__,
+                        True,
+                        "1.1.2-alpha.1",
+                        None,
+                    ),
                     (
-                        repo_w_git_flow_and_release_channels_scipy_commits.__name__,
-                        "alpha",
-                    ): [
-                        (scipy_patch_commits.__name__, False, "1.1.1", None),
-                        (
-                            scipy_patch_commits.__name__,
-                            True,
-                            "1.1.1-alpha.1",
-                            None,
-                        ),
-                        (scipy_minor_commits.__name__, False, "1.2.0", None),
-                        (
-                            scipy_minor_commits.__name__,
-                            True,
-                            "1.2.0-alpha.1",
-                            None,
-                        ),
-                        (scipy_major_commits.__name__, False, "2.0.0", None),
-                        (
-                            scipy_major_commits.__name__,
-                            True,
-                            "2.0.0-alpha.1",
-                            None,
-                        ),
-                    ],
-                }.items()
-                for (
-                    commit_messages,
-                    prerelease,
-                    expected_new_version,
-                    branch_name,
-                ) in values
-            ],
-        ]
+                        scipy_minor_commits.__name__,
+                        False,
+                        "1.2.0",
+                        None,
+                    ),
+                    (
+                        scipy_minor_commits.__name__,
+                        True,
+                        "1.2.0-alpha.3",
+                        "feat/feature-4",  # branch
+                    ),
+                    (scipy_major_commits.__name__, False, "2.0.0", None),
+                    (
+                        scipy_major_commits.__name__,
+                        True,
+                        "2.0.0-alpha.1",
+                        None,
+                    ),
+                ],
+                # Latest version for repo_with_git_flow_and_release_channels is
+                # currently 1.1.0
+                (
+                    repo_w_git_flow_w_rc_n_alpha_prereleases_n_scipy_commits.__name__,
+                    "alpha",
+                ): [
+                    (scipy_patch_commits.__name__, False, "1.1.1", None),
+                    (
+                        scipy_patch_commits.__name__,
+                        True,
+                        "1.1.1-alpha.1",
+                        None,
+                    ),
+                    (scipy_minor_commits.__name__, False, "1.2.0", None),
+                    (
+                        scipy_minor_commits.__name__,
+                        True,
+                        "1.2.0-alpha.1",
+                        None,
+                    ),
+                    (scipy_major_commits.__name__, False, "2.0.0", None),
+                    (
+                        scipy_major_commits.__name__,
+                        True,
+                        "2.0.0-alpha.1",
+                        None,
+                    ),
+                ],
+            }.items()
+            for (
+                commit_messages,
+                prerelease,
+                expected_new_version,
+                branch_name,
+            ) in values  # type: ignore[attr-defined]
+        ],
     ),
 )
 def test_version_next_greater_than_version_one_scipy(
-    repo: Repo,
+    repo_result: BuiltRepoResult,
     commit_messages: list[str],
     prerelease: bool,
     prerelease_token: str,
     next_release_version: str,
     branch_name: str,
-    cli_runner: CliRunner,
+    run_cli: RunCliFn,
     file_in_repo: str,
+    mocked_git_fetch: MagicMock,
     mocked_git_push: MagicMock,
     post_mocker: Mocker,
+    stable_now_date: GetStableDateNowFn,
 ):
+    repo = repo_result["repo"]
+
     # setup: select the branch we desire for the next bump
     if repo.active_branch.name != branch_name:
         repo.heads[branch_name].checkout()
 
     # setup: apply commits to the repo
+    stable_now_datetime = stable_now_date()
+    commit_timestamp_gen = (
+        (stable_now_datetime + timedelta(seconds=i)).isoformat(timespec="seconds")
+        for i in count(step=1)
+    )
     for commit_message in commit_messages or []:
         add_text_to_file(repo, file_in_repo)
-        repo.git.commit(m=commit_message, a=True)
+        repo.git.commit(m=commit_message, a=True, date=next(commit_timestamp_gen))
+        # Fake an automated push to remote by updating the remote tracking branch
+        repo.git.update_ref(
+            f"refs/remotes/origin/{repo.active_branch.name}",
+            repo.head.commit.hexsha,
+        )
 
     # Setup: take measurement before running the version command
     head_sha_before = repo.head.commit.hexsha
@@ -1118,12 +1205,12 @@ def test_version_next_greater_than_version_one_scipy(
 
     # Act
     cli_cmd = [MAIN_PROG_NAME, VERSION_SUBCMD, *prerelease_args]
-    result = cli_runner.invoke(main, cli_cmd[1:])
+    result = run_cli(cli_cmd[1:])
 
     # take measurement after running the version command
     head_after = repo.head.commit
     tags_after = {tag.name for tag in repo.tags}
-    tags_set_difference = set.difference(tags_after, tags_before)
+    tags_set_difference = cast("set[str]", set.difference(tags_after, tags_before))
 
     # Evaluate (normal release actions should have occurred when forced patch bump)
     assert_successful_exit_code(result, cli_cmd)
@@ -1134,6 +1221,7 @@ def test_version_next_greater_than_version_one_scipy(
     assert len(tags_set_difference) == 1  # A tag has been created
     assert f"v{next_release_version}" in tags_set_difference
 
+    assert mocked_git_fetch.call_count == 1  # fetch called to check for remote changes
     assert mocked_git_push.call_count == 2  # 1 for commit, 1 for tag
     assert post_mocker.call_count == 1  # vcs release creation occurred
 
@@ -1142,7 +1230,7 @@ def test_version_next_greater_than_version_one_scipy(
     str.join(
         ", ",
         [
-            "repo",
+            "repo_result",
             "commit_messages",
             "prerelease",
             "prerelease_token",
@@ -1167,11 +1255,11 @@ def test_version_next_greater_than_version_one_scipy(
                     # The last full release version was 1.1.1, so it's had a minor
                     # prerelease
                     (
-                        repo_w_git_flow_scipy_commits.__name__,
+                        repo_w_git_flow_w_alpha_prereleases_n_scipy_commits.__name__,
                         "alpha",
                     ): [
                         *(
-                            (commits, True, "1.2.0-alpha.2", "feat/feature-3")
+                            (commits, True, "1.2.0-alpha.2", "feat/feature-4")
                             for commits in (
                                 None,
                                 scipy_chore_commits.__name__,
@@ -1188,7 +1276,7 @@ def test_version_next_greater_than_version_one_scipy(
                     # Latest version for repo_with_git_flow_and_release_channels is
                     # currently 1.1.0
                     (
-                        repo_w_git_flow_and_release_channels_scipy_commits.__name__,
+                        repo_w_git_flow_w_rc_n_alpha_prereleases_n_scipy_commits.__name__,
                         "alpha",
                     ): [
                         *(
@@ -1206,31 +1294,45 @@ def test_version_next_greater_than_version_one_scipy(
                     prerelease,
                     expected_new_version,
                     branch_name,
-                ) in values
+                ) in values  # type: ignore[attr-defined]
             ],
         ]
     ),
 )
 def test_version_next_greater_than_version_one_no_bump_scipy(
-    repo: Repo,
+    repo_result: BuiltRepoResult,
     commit_messages: list[str],
     prerelease: bool,
     prerelease_token: str,
     next_release_version: str,
     branch_name: str,
-    cli_runner: CliRunner,
+    run_cli: RunCliFn,
     file_in_repo: str,
+    mocked_git_fetch: MagicMock,
     mocked_git_push: MagicMock,
     post_mocker: Mocker,
+    stable_now_date: GetStableDateNowFn,
 ):
+    repo = repo_result["repo"]
+
     # setup: select the branch we desire for the next bump
     if repo.active_branch.name != branch_name:
         repo.heads[branch_name].checkout()
 
     # setup: apply commits to the repo
+    stable_now_datetime = stable_now_date()
+    commit_timestamp_gen = (
+        (stable_now_datetime + timedelta(seconds=i)).isoformat(timespec="seconds")
+        for i in count(step=1)
+    )
     for commit_message in commit_messages or []:
         add_text_to_file(repo, file_in_repo)
-        repo.git.commit(m=commit_message, a=True)
+        repo.git.commit(m=commit_message, a=True, date=next(commit_timestamp_gen))
+        # Fake an automated push to remote by updating the remote tracking branch
+        repo.git.update_ref(
+            f"refs/remotes/origin/{repo.active_branch.name}",
+            repo.head.commit.hexsha,
+        )
 
     # Setup: take measurement before running the version command
     head_sha_before = repo.head.commit.hexsha
@@ -1249,12 +1351,12 @@ def test_version_next_greater_than_version_one_no_bump_scipy(
 
     # Act
     cli_cmd = [MAIN_PROG_NAME, VERSION_SUBCMD, *prerelease_args]
-    result = cli_runner.invoke(main, cli_cmd[1:])
+    result = run_cli(cli_cmd[1:])
 
     # take measurement after running the version command
     head_after = repo.head.commit
     tags_after = {tag.name for tag in repo.tags}
-    tags_set_difference = set.difference(tags_after, tags_before)
+    tags_set_difference = cast("set[str]", set.difference(tags_after, tags_before))
 
     # Evaluate (no release actions should have occurred when no bump)
     assert_successful_exit_code(result, cli_cmd)
@@ -1263,6 +1365,7 @@ def test_version_next_greater_than_version_one_no_bump_scipy(
     # No commit has been made
     assert head_sha_before == head_after.hexsha
     assert len(tags_set_difference) == 0  # No tag created
+    assert mocked_git_fetch.call_count == 0  # no git fetch called
     assert mocked_git_push.call_count == 0  # no git push of tag or commit
     assert post_mocker.call_count == 0  # no vcs release
 
@@ -1276,7 +1379,7 @@ def test_version_next_greater_than_version_one_no_bump_scipy(
     str.join(
         ", ",
         [
-            "repo",
+            "repo_result",
             "commit_messages",
             "prerelease",
             "prerelease_token",
@@ -1293,8 +1396,8 @@ def test_version_next_greater_than_version_one_no_bump_scipy(
                 # It's biggest change type is minor, so the next version should be 0.1.0
                 # Given the major_on_zero is False and the version is starting at 0.0.0,
                 # the major level commits are limited to only causing a minor level bump
-                lazy_fixture(repo_w_no_tags_angular_commits.__name__),
-                lazy_fixture(angular_major_commits.__name__),
+                lazy_fixture(repo_w_no_tags_conventional_commits.__name__),
+                lazy_fixture(conventional_major_commits.__name__),
                 False,
                 "rc",
                 False,
@@ -1318,7 +1421,7 @@ def test_version_next_greater_than_version_one_no_bump_scipy(
                     # Latest version for repo_with_no_tags is currently 0.0.0 (default)
                     # It's biggest change type is minor, so the next version should be 0.1.0
                     (
-                        repo_w_no_tags_angular_commits.__name__,
+                        repo_w_no_tags_conventional_commits.__name__,
                         None,
                     ): [
                         *(
@@ -1331,21 +1434,21 @@ def test_version_next_greater_than_version_one_no_bump_scipy(
                                 # will be a minor change and thus the version will be bumped to 0.1.0
                                 None,
                                 # Non version bumping commits are absorbed into the previously detected minor bump
-                                lazy_fixture(angular_chore_commits.__name__),
+                                lazy_fixture(conventional_chore_commits.__name__),
                                 # Patch commits are absorbed into the previously detected minor bump
-                                lazy_fixture(angular_patch_commits.__name__),
+                                lazy_fixture(conventional_patch_commits.__name__),
                                 # Minor level commits are absorbed into the previously detected minor bump
-                                lazy_fixture(angular_minor_commits.__name__),
+                                lazy_fixture(conventional_minor_commits.__name__),
                                 # Given the major_on_zero is False and the version is starting at 0.0.0,
                                 # the major level commits are limited to only causing a minor level bump
-                                # lazy_fixture(angular_major_commits.__name__), # used as default
+                                # lazy_fixture(conventional_major_commits.__name__), # used as default
                             )
                         ),
                         # when prerelease is False, & major_on_zero is False, & allow_zero_version is True,
                         # the version should only be minor bumped when provided major commits because
                         # of the major_on_zero value
                         (
-                            lazy_fixture(angular_major_commits.__name__),
+                            lazy_fixture(conventional_major_commits.__name__),
                             False,
                             False,
                             True,
@@ -1356,7 +1459,7 @@ def test_version_next_greater_than_version_one_no_bump_scipy(
                         # the version should be major bumped when provided major commits because
                         # of the major_on_zero value
                         (
-                            lazy_fixture(angular_major_commits.__name__),
+                            lazy_fixture(conventional_major_commits.__name__),
                             False,
                             True,
                             True,
@@ -1371,17 +1474,17 @@ def test_version_next_greater_than_version_one_no_bump_scipy(
                             for major_on_zero in (True, False)
                             for commits in (
                                 None,
-                                lazy_fixture(angular_chore_commits.__name__),
-                                lazy_fixture(angular_patch_commits.__name__),
-                                lazy_fixture(angular_minor_commits.__name__),
-                                lazy_fixture(angular_major_commits.__name__),
+                                lazy_fixture(conventional_chore_commits.__name__),
+                                lazy_fixture(conventional_patch_commits.__name__),
+                                lazy_fixture(conventional_minor_commits.__name__),
+                                lazy_fixture(conventional_major_commits.__name__),
                             )
                         ),
                     ],
                     # Latest version for repo_with_single_branch is currently 0.1.1
                     # Note repo_with_single_branch isn't modelled with prereleases
                     (
-                        repo_w_trunk_only_angular_commits.__name__,
+                        repo_w_trunk_only_conventional_commits.__name__,
                         None,
                     ): [
                         *(
@@ -1389,7 +1492,7 @@ def test_version_next_greater_than_version_one_no_bump_scipy(
                             # the version is patch bumped because of the patch level commits
                             # regardless of the major_on_zero value
                             (
-                                lazy_fixture(angular_patch_commits.__name__),
+                                lazy_fixture(conventional_patch_commits.__name__),
                                 False,
                                 major_on_zero,
                                 True,
@@ -1403,15 +1506,15 @@ def test_version_next_greater_than_version_one_no_bump_scipy(
                             # the version is minor bumped because of the major_on_zero value=False
                             (commits, False, False, True, "0.2.0", None)
                             for commits in (
-                                lazy_fixture(angular_minor_commits.__name__),
-                                lazy_fixture(angular_major_commits.__name__),
+                                lazy_fixture(conventional_minor_commits.__name__),
+                                lazy_fixture(conventional_major_commits.__name__),
                             )
                         ),
                         # when prerelease must be False, and allow_zero_version is True,
                         # but the major_on_zero is True, then when a major level commit is given,
                         # the version should be bumped to the next major version
                         (
-                            lazy_fixture(angular_major_commits.__name__),
+                            lazy_fixture(conventional_major_commits.__name__),
                             False,
                             True,
                             True,
@@ -1425,24 +1528,24 @@ def test_version_next_greater_than_version_one_no_bump_scipy(
                             for major_on_zero in (True, False)
                             for commits in (
                                 None,
-                                lazy_fixture(angular_chore_commits.__name__),
-                                lazy_fixture(angular_patch_commits.__name__),
-                                lazy_fixture(angular_minor_commits.__name__),
-                                lazy_fixture(angular_major_commits.__name__),
+                                lazy_fixture(conventional_chore_commits.__name__),
+                                lazy_fixture(conventional_patch_commits.__name__),
+                                lazy_fixture(conventional_minor_commits.__name__),
+                                lazy_fixture(conventional_major_commits.__name__),
                             )
                         ),
                     ],
                     # Latest version for repo_with_single_branch_and_prereleases is
                     # currently 0.2.0
                     (
-                        repo_w_trunk_only_n_prereleases_angular_commits.__name__,
+                        repo_w_trunk_only_n_prereleases_conventional_commits.__name__,
                         None,
                     ): [
                         # when allow_zero_version is True,
                         # prerelease is False, & major_on_zero is False, the version should be
                         # patch bumped as a prerelease version, when given patch level commits
                         (
-                            lazy_fixture(angular_patch_commits.__name__),
+                            lazy_fixture(conventional_patch_commits.__name__),
                             True,
                             False,
                             True,
@@ -1453,7 +1556,7 @@ def test_version_next_greater_than_version_one_no_bump_scipy(
                         # prerelease is False, & major_on_zero is False, the version should be
                         # patch bumped, when given patch level commits
                         (
-                            lazy_fixture(angular_patch_commits.__name__),
+                            lazy_fixture(conventional_patch_commits.__name__),
                             False,
                             False,
                             True,
@@ -1466,8 +1569,8 @@ def test_version_next_greater_than_version_one_no_bump_scipy(
                             # minor bumped as a prerelease version, when given commits of a minor or major level
                             (commits, True, False, True, "0.3.0-rc.1", None)
                             for commits in (
-                                lazy_fixture(angular_minor_commits.__name__),
-                                lazy_fixture(angular_major_commits.__name__),
+                                lazy_fixture(conventional_minor_commits.__name__),
+                                lazy_fixture(conventional_major_commits.__name__),
                             )
                         ),
                         *(
@@ -1476,15 +1579,15 @@ def test_version_next_greater_than_version_one_no_bump_scipy(
                             # minor or major level because major_on_zero = False
                             (commits, False, False, True, "0.3.0", None)
                             for commits in (
-                                lazy_fixture(angular_minor_commits.__name__),
-                                lazy_fixture(angular_major_commits.__name__),
+                                lazy_fixture(conventional_minor_commits.__name__),
+                                lazy_fixture(conventional_major_commits.__name__),
                             )
                         ),
                         # when prerelease is True, & major_on_zero is True, and allow_zero_version
                         # is True, the version should be bumped to 1.0.0 as a prerelease version, when
                         # given major level commits
                         (
-                            lazy_fixture(angular_major_commits.__name__),
+                            lazy_fixture(conventional_major_commits.__name__),
                             True,
                             True,
                             True,
@@ -1494,7 +1597,7 @@ def test_version_next_greater_than_version_one_no_bump_scipy(
                         # when prerelease is False, & major_on_zero is True, and allow_zero_version
                         # is True, the version should be bumped to 1.0.0, when given major level commits
                         (
-                            lazy_fixture(angular_major_commits.__name__),
+                            lazy_fixture(conventional_major_commits.__name__),
                             False,
                             True,
                             True,
@@ -1509,10 +1612,10 @@ def test_version_next_greater_than_version_one_no_bump_scipy(
                             for major_on_zero in (True, False)
                             for commits in (
                                 None,
-                                lazy_fixture(angular_chore_commits.__name__),
-                                lazy_fixture(angular_patch_commits.__name__),
-                                lazy_fixture(angular_minor_commits.__name__),
-                                lazy_fixture(angular_major_commits.__name__),
+                                lazy_fixture(conventional_chore_commits.__name__),
+                                lazy_fixture(conventional_patch_commits.__name__),
+                                lazy_fixture(conventional_minor_commits.__name__),
+                                lazy_fixture(conventional_major_commits.__name__),
                             )
                         ),
                         *(
@@ -1522,9 +1625,9 @@ def test_version_next_greater_than_version_one_no_bump_scipy(
                             (commits, False, major_on_zero, False, "1.0.0", None)
                             for major_on_zero in (True, False)
                             for commits in (
-                                lazy_fixture(angular_patch_commits.__name__),
-                                lazy_fixture(angular_minor_commits.__name__),
-                                lazy_fixture(angular_major_commits.__name__),
+                                lazy_fixture(conventional_patch_commits.__name__),
+                                lazy_fixture(conventional_minor_commits.__name__),
+                                lazy_fixture(conventional_major_commits.__name__),
                             )
                         ),
                     ],
@@ -1536,13 +1639,13 @@ def test_version_next_greater_than_version_one_no_bump_scipy(
                     allow_zero_version,
                     next_release_version,
                     branch_name,
-                ) in values
+                ) in values  # type: ignore[attr-defined]
             ],
         ],
     ),
 )
-def test_version_next_w_zero_dot_versions_angular(
-    repo: Repo,
+def test_version_next_w_zero_dot_versions_conventional(
+    repo_result: BuiltRepoResult,
     commit_messages: list[str],
     prerelease: bool,
     prerelease_token: str,
@@ -1550,12 +1653,16 @@ def test_version_next_w_zero_dot_versions_angular(
     branch_name: str,
     major_on_zero: bool,
     allow_zero_version: bool,
-    cli_runner: CliRunner,
+    run_cli: RunCliFn,
     file_in_repo: str,
     update_pyproject_toml: UpdatePyprojectTomlFn,
+    mocked_git_fetch: MagicMock,
     mocked_git_push: MagicMock,
     post_mocker: Mocker,
+    stable_now_date: GetStableDateNowFn,
 ):
+    repo = repo_result["repo"]
+
     # setup: select the branch we desire for the next bump
     if repo.active_branch.name != branch_name:
         repo.heads[branch_name].checkout()
@@ -1567,9 +1674,19 @@ def test_version_next_w_zero_dot_versions_angular(
     update_pyproject_toml("tool.semantic_release.major_on_zero", major_on_zero)
 
     # setup: apply commits to the repo
+    stable_now_datetime = stable_now_date()
+    commit_timestamp_gen = (
+        (stable_now_datetime + timedelta(seconds=i)).isoformat(timespec="seconds")
+        for i in count(step=1)
+    )
     for commit_message in commit_messages or []:
         add_text_to_file(repo, file_in_repo)
-        repo.git.commit(m=commit_message, a=True)
+        repo.git.commit(m=commit_message, a=True, date=next(commit_timestamp_gen))
+        # Fake an automated push to remote by updating the remote tracking branch
+        repo.git.update_ref(
+            f"refs/remotes/origin/{repo.active_branch.name}",
+            repo.head.commit.hexsha,
+        )
 
     # Setup: take measurement before running the version command
     head_sha_before = repo.head.commit.hexsha
@@ -1588,12 +1705,12 @@ def test_version_next_w_zero_dot_versions_angular(
 
     # Act
     cli_cmd = [MAIN_PROG_NAME, VERSION_SUBCMD, *prerelease_args]
-    result = cli_runner.invoke(main, cli_cmd[1:])
+    result = run_cli(cli_cmd[1:])
 
     # take measurement after running the version command
     head_after = repo.head.commit
     tags_after = {tag.name for tag in repo.tags}
-    tags_set_difference = set.difference(tags_after, tags_before)
+    tags_set_difference = cast("set[str]", set.difference(tags_after, tags_before))
 
     # Evaluate (normal release actions should have occurred when forced patch bump)
     assert_successful_exit_code(result, cli_cmd)
@@ -1604,6 +1721,7 @@ def test_version_next_w_zero_dot_versions_angular(
     assert len(tags_set_difference) == 1  # A tag has been created
     assert f"v{next_release_version}" in tags_set_difference
 
+    assert mocked_git_fetch.call_count == 1  # fetch called to check for remote changes
     assert mocked_git_push.call_count == 2  # 1 for commit, 1 for tag
     assert post_mocker.call_count == 1  # vcs release creation occurred
 
@@ -1612,7 +1730,7 @@ def test_version_next_w_zero_dot_versions_angular(
     str.join(
         ", ",
         [
-            "repo",
+            "repo_result",
             "commit_messages",
             "prerelease",
             "prerelease_token",
@@ -1640,7 +1758,7 @@ def test_version_next_w_zero_dot_versions_angular(
                     # Latest version for repo_with_single_branch is currently 0.1.1
                     # Note repo_with_single_branch isn't modelled with prereleases
                     (
-                        repo_w_trunk_only_angular_commits.__name__,
+                        repo_w_trunk_only_conventional_commits.__name__,
                         None,
                     ): [
                         *(
@@ -1651,14 +1769,14 @@ def test_version_next_w_zero_dot_versions_angular(
                             for major_on_zero in (True, False)
                             for commits in (
                                 None,
-                                lazy_fixture(angular_chore_commits.__name__),
+                                lazy_fixture(conventional_chore_commits.__name__),
                             )
                         ),
                     ],
                     # Latest version for repo_with_single_branch_and_prereleases is
                     # currently 0.2.0
                     (
-                        repo_w_trunk_only_n_prereleases_angular_commits.__name__,
+                        repo_w_trunk_only_n_prereleases_conventional_commits.__name__,
                         None,
                     ): [
                         *(
@@ -1670,7 +1788,7 @@ def test_version_next_w_zero_dot_versions_angular(
                             for major_on_zero in (True, False)
                             for commits in (
                                 None,
-                                lazy_fixture(angular_chore_commits.__name__),
+                                lazy_fixture(conventional_chore_commits.__name__),
                             )
                         ),
                     ],
@@ -1682,13 +1800,13 @@ def test_version_next_w_zero_dot_versions_angular(
                     allow_zero_version,
                     next_release_version,
                     branch_name,
-                ) in values
+                ) in values  # type: ignore[attr-defined]
             ],
         ],
     ),
 )
-def test_version_next_w_zero_dot_versions_no_bump_angular(
-    repo: Repo,
+def test_version_next_w_zero_dot_versions_no_bump_conventional(
+    repo_result: BuiltRepoResult,
     commit_messages: list[str],
     prerelease: bool,
     prerelease_token: str,
@@ -1696,12 +1814,16 @@ def test_version_next_w_zero_dot_versions_no_bump_angular(
     branch_name: str,
     major_on_zero: bool,
     allow_zero_version: bool,
-    cli_runner: CliRunner,
+    run_cli: RunCliFn,
     file_in_repo: str,
     update_pyproject_toml: UpdatePyprojectTomlFn,
+    mocked_git_fetch: MagicMock,
     mocked_git_push: MagicMock,
     post_mocker: Mocker,
+    stable_now_date: GetStableDateNowFn,
 ):
+    repo = repo_result["repo"]
+
     # setup: select the branch we desire for the next bump
     if repo.active_branch.name != branch_name:
         repo.heads[branch_name].checkout()
@@ -1713,9 +1835,19 @@ def test_version_next_w_zero_dot_versions_no_bump_angular(
     update_pyproject_toml("tool.semantic_release.major_on_zero", major_on_zero)
 
     # setup: apply commits to the repo
+    stable_now_datetime = stable_now_date()
+    commit_timestamp_gen = (
+        (stable_now_datetime + timedelta(seconds=i)).isoformat(timespec="seconds")
+        for i in count(step=1)
+    )
     for commit_message in commit_messages or []:
         add_text_to_file(repo, file_in_repo)
-        repo.git.commit(m=commit_message, a=True)
+        repo.git.commit(m=commit_message, a=True, date=next(commit_timestamp_gen))
+        # Fake an automated push to remote by updating the remote tracking branch
+        repo.git.update_ref(
+            f"refs/remotes/origin/{repo.active_branch.name}",
+            repo.head.commit.hexsha,
+        )
 
     # Setup: take measurement before running the version command
     head_sha_before = repo.head.commit.hexsha
@@ -1734,12 +1866,12 @@ def test_version_next_w_zero_dot_versions_no_bump_angular(
 
     # Act
     cli_cmd = [MAIN_PROG_NAME, VERSION_SUBCMD, *prerelease_args]
-    result = cli_runner.invoke(main, cli_cmd[1:])
+    result = run_cli(cli_cmd[1:])
 
     # take measurement after running the version command
     head_after = repo.head.commit
     tags_after = {tag.name for tag in repo.tags}
-    tags_set_difference = set.difference(tags_after, tags_before)
+    tags_set_difference = cast("set[str]", set.difference(tags_after, tags_before))
 
     # Evaluate (no release actions should have occurred when no bump)
     assert_successful_exit_code(result, cli_cmd)
@@ -1748,6 +1880,7 @@ def test_version_next_w_zero_dot_versions_no_bump_angular(
     # No commit has been made
     assert head_sha_before == head_after.hexsha
     assert len(tags_set_difference) == 0  # No tag created
+    assert mocked_git_fetch.call_count == 0  # no git fetch called
     assert mocked_git_push.call_count == 0  # no git push of tag or commit
     assert post_mocker.call_count == 0  # no vcs release
 
@@ -1756,7 +1889,7 @@ def test_version_next_w_zero_dot_versions_no_bump_angular(
     str.join(
         ", ",
         [
-            "repo",
+            "repo_result",
             "commit_messages",
             "prerelease",
             "prerelease_token",
@@ -1768,261 +1901,245 @@ def test_version_next_w_zero_dot_versions_no_bump_angular(
     ),
     xdist_sort_hack(
         [
-            (
+            pytest.param(
+                lazy_fixture(repo_fixture_name),
+                commit_messages,
+                prerelease,
+                "rc" if prerelease_token is None else prerelease_token,
+                major_on_zero,
+                allow_zero_version,
+                next_release_version,
+                "main" if branch_name is None else branch_name,
+                marks=pytest.mark.comprehensive,
+            )
+            for (repo_fixture_name, prerelease_token), values in {
                 # Latest version for repo_with_no_tags is currently 0.0.0 (default)
                 # It's biggest change type is minor, so the next version should be 0.1.0
-                # Given the major_on_zero is False and the version is starting at 0.0.0,
-                # the major level commits are limited to only causing a minor level bump
-                lazy_fixture(repo_w_no_tags_emoji_commits.__name__),
-                lazy_fixture(emoji_major_commits.__name__),
-                False,
-                "rc",
-                False,
-                True,
-                "0.1.0",
-                "main",
-            ),
-            *[
-                pytest.param(
-                    lazy_fixture(repo_fixture_name),
-                    commit_messages,
-                    prerelease,
-                    "rc" if prerelease_token is None else prerelease_token,
-                    major_on_zero,
-                    allow_zero_version,
-                    next_release_version,
-                    "main" if branch_name is None else branch_name,
-                    marks=pytest.mark.comprehensive,
-                )
-                for (repo_fixture_name, prerelease_token), values in {
-                    # Latest version for repo_with_no_tags is currently 0.0.0 (default)
-                    # It's biggest change type is minor, so the next version should be 0.1.0
-                    (
-                        repo_w_no_tags_emoji_commits.__name__,
-                        None,
-                    ): [
-                        *(
-                            # when prerelease is False, & major_on_zero is False &
-                            # allow_zero_version is True, the version should be
-                            # 0.1.0, with the given commits
-                            (commits, False, False, True, "0.1.0", None)
-                            for commits in (
-                                # Even when this test does not change anything, the base modification
-                                # will be a minor change and thus the version will be bumped to 0.1.0
-                                None,
-                                # Non version bumping commits are absorbed into the previously detected minor bump
-                                lazy_fixture(emoji_chore_commits.__name__),
-                                # Patch commits are absorbed into the previously detected minor bump
-                                lazy_fixture(emoji_patch_commits.__name__),
-                                # Minor level commits are absorbed into the previously detected minor bump
-                                lazy_fixture(emoji_minor_commits.__name__),
-                                # Given the major_on_zero is False and the version is starting at 0.0.0,
-                                # the major level commits are limited to only causing a minor level bump
-                                # lazy_fixture(emoji_major_commits.__name__), # used as default
-                            )
-                        ),
-                        # when prerelease is False, & major_on_zero is False, & allow_zero_version is True,
-                        # the version should only be minor bumped when provided major commits because
-                        # of the major_on_zero value
-                        (
-                            lazy_fixture(emoji_major_commits.__name__),
-                            False,
-                            False,
-                            True,
-                            "0.1.0",
+                (
+                    repo_w_no_tags_emoji_commits.__name__,
+                    None,
+                ): [
+                    *(
+                        # when prerelease is False, & major_on_zero is False &
+                        # allow_zero_version is True, the version should be
+                        # 0.1.0, with the given commits
+                        (commits, False, False, True, "0.1.0", None)
+                        for commits in (
+                            # Even when this test does not change anything, the base modification
+                            # will be a minor change and thus the version will be bumped to 0.1.0
                             None,
-                        ),
-                        # when prerelease is False, & major_on_zero is True & allow_zero_version is True,
-                        # the version should be major bumped when provided major commits because
-                        # of the major_on_zero value
-                        (
+                            # Non version bumping commits are absorbed into the previously detected minor bump
+                            lazy_fixture(emoji_chore_commits.__name__),
+                            # Patch commits are absorbed into the previously detected minor bump
+                            lazy_fixture(emoji_patch_commits.__name__),
+                            # Minor level commits are absorbed into the previously detected minor bump
+                            lazy_fixture(emoji_minor_commits.__name__),
+                            # Given the major_on_zero is False and the version is starting at 0.0.0,
+                            # the major level commits are limited to only causing a minor level bump
                             lazy_fixture(emoji_major_commits.__name__),
-                            False,
-                            True,
-                            True,
-                            "1.0.0",
-                            None,
-                        ),
-                        *(
-                            # when prerelease is False, & allow_zero_version is False, the version should be
-                            # 1.0.0, across the board because 0 is not a valid major version.
-                            # major_on_zero is ignored as it is not relevant but tested for completeness
-                            (commits, False, major_on_zero, False, "1.0.0", None)
-                            for major_on_zero in (True, False)
-                            for commits in (
-                                None,
-                                lazy_fixture(emoji_chore_commits.__name__),
-                                lazy_fixture(emoji_patch_commits.__name__),
-                                lazy_fixture(emoji_minor_commits.__name__),
-                                lazy_fixture(emoji_major_commits.__name__),
-                            )
-                        ),
-                    ],
-                    # Latest version for repo_with_single_branch is currently 0.1.1
-                    # Note repo_with_single_branch isn't modelled with prereleases
+                        )
+                    ),
+                    # when prerelease is False, & major_on_zero is False, & allow_zero_version is True,
+                    # the version should only be minor bumped when provided major commits because
+                    # of the major_on_zero value
                     (
-                        repo_w_trunk_only_emoji_commits.__name__,
+                        lazy_fixture(emoji_major_commits.__name__),
+                        False,
+                        False,
+                        True,
+                        "0.1.0",
                         None,
-                    ): [
-                        *(
-                            # when prerelease must be False, and allow_zero_version is True,
-                            # the version is patch bumped because of the patch level commits
-                            # regardless of the major_on_zero value
-                            (
-                                lazy_fixture(emoji_patch_commits.__name__),
-                                False,
-                                major_on_zero,
-                                True,
-                                "0.1.2",
-                                None,
-                            )
-                            for major_on_zero in (True, False)
-                        ),
-                        *(
-                            # when prerelease must be False, and allow_zero_version is True,
-                            # the version is minor bumped because of the major_on_zero value=False
-                            (commits, False, False, True, "0.2.0", None)
-                            for commits in (
-                                lazy_fixture(emoji_minor_commits.__name__),
-                                lazy_fixture(emoji_major_commits.__name__),
-                            )
-                        ),
+                    ),
+                    # when prerelease is False, & major_on_zero is True & allow_zero_version is True,
+                    # the version should be major bumped when provided major commits because
+                    # of the major_on_zero value
+                    (
+                        lazy_fixture(emoji_major_commits.__name__),
+                        False,
+                        True,
+                        True,
+                        "1.0.0",
+                        None,
+                    ),
+                    *(
+                        # when prerelease is False, & allow_zero_version is False, the version should be
+                        # 1.0.0, across the board because 0 is not a valid major version.
+                        # major_on_zero is ignored as it is not relevant but tested for completeness
+                        (commits, False, major_on_zero, False, "1.0.0", None)
+                        for major_on_zero in (True, False)
+                        for commits in (
+                            None,
+                            lazy_fixture(emoji_chore_commits.__name__),
+                            lazy_fixture(emoji_patch_commits.__name__),
+                            lazy_fixture(emoji_minor_commits.__name__),
+                            lazy_fixture(emoji_major_commits.__name__),
+                        )
+                    ),
+                ],
+                # Latest version for repo_with_single_branch is currently 0.1.1
+                # Note repo_with_single_branch isn't modelled with prereleases
+                (
+                    repo_w_trunk_only_emoji_commits.__name__,
+                    None,
+                ): [
+                    *(
                         # when prerelease must be False, and allow_zero_version is True,
-                        # but the major_on_zero is True, then when a major level commit is given,
-                        # the version should be bumped to the next major version
+                        # the version is patch bumped because of the patch level commits
+                        # regardless of the major_on_zero value
                         (
-                            lazy_fixture(emoji_major_commits.__name__),
+                            lazy_fixture(emoji_patch_commits.__name__),
                             False,
+                            major_on_zero,
                             True,
-                            True,
-                            "1.0.0",
+                            "0.1.2",
                             None,
-                        ),
-                        *(
-                            # when prerelease must be False, & allow_zero_version is False, the version should be
-                            # 1.0.0, with any change regardless of major_on_zero
-                            (commits, False, major_on_zero, False, "1.0.0", None)
-                            for major_on_zero in (True, False)
-                            for commits in (
-                                None,
-                                lazy_fixture(emoji_chore_commits.__name__),
-                                lazy_fixture(emoji_patch_commits.__name__),
-                                lazy_fixture(emoji_minor_commits.__name__),
-                                lazy_fixture(emoji_major_commits.__name__),
-                            )
-                        ),
-                    ],
-                    # Latest version for repo_with_single_branch_and_prereleases is
-                    # currently 0.2.0
+                        )
+                        for major_on_zero in (True, False)
+                    ),
+                    *(
+                        # when prerelease must be False, and allow_zero_version is True,
+                        # the version is minor bumped because of the major_on_zero value=False
+                        (commits, False, False, True, "0.2.0", None)
+                        for commits in (
+                            lazy_fixture(emoji_minor_commits.__name__),
+                            lazy_fixture(emoji_major_commits.__name__),
+                        )
+                    ),
+                    # when prerelease must be False, and allow_zero_version is True,
+                    # but the major_on_zero is True, then when a major level commit is given,
+                    # the version should be bumped to the next major version
                     (
-                        repo_w_trunk_only_n_prereleases_emoji_commits.__name__,
+                        lazy_fixture(emoji_major_commits.__name__),
+                        False,
+                        True,
+                        True,
+                        "1.0.0",
                         None,
-                    ): [
-                        # when allow_zero_version is True,
-                        # prerelease is False, & major_on_zero is False, the version should be
-                        # patch bumped as a prerelease version, when given patch level commits
-                        (
+                    ),
+                    *(
+                        # when prerelease must be False, & allow_zero_version is False, the version should be
+                        # 1.0.0, with any change regardless of major_on_zero
+                        (commits, False, major_on_zero, False, "1.0.0", None)
+                        for major_on_zero in (True, False)
+                        for commits in (
+                            None,
+                            lazy_fixture(emoji_chore_commits.__name__),
                             lazy_fixture(emoji_patch_commits.__name__),
-                            True,
-                            False,
-                            True,
-                            "0.2.1-rc.1",
-                            None,
-                        ),
+                            lazy_fixture(emoji_minor_commits.__name__),
+                            lazy_fixture(emoji_major_commits.__name__),
+                        )
+                    ),
+                ],
+                # Latest version for repo_with_single_branch_and_prereleases is
+                # currently 0.2.0
+                (
+                    repo_w_trunk_only_n_prereleases_emoji_commits.__name__,
+                    None,
+                ): [
+                    # when allow_zero_version is True,
+                    # prerelease is False, & major_on_zero is False, the version should be
+                    # patch bumped as a prerelease version, when given patch level commits
+                    (
+                        lazy_fixture(emoji_patch_commits.__name__),
+                        True,
+                        False,
+                        True,
+                        "0.2.1-rc.1",
+                        None,
+                    ),
+                    # when allow_zero_version is True,
+                    # prerelease is False, & major_on_zero is False, the version should be
+                    # patch bumped, when given patch level commits
+                    (
+                        lazy_fixture(emoji_patch_commits.__name__),
+                        False,
+                        False,
+                        True,
+                        "0.2.1",
+                        None,
+                    ),
+                    *(
                         # when allow_zero_version is True,
-                        # prerelease is False, & major_on_zero is False, the version should be
-                        # patch bumped, when given patch level commits
-                        (
+                        # prerelease is True, & major_on_zero is False, the version should be
+                        # minor bumped as a prerelease version, when given commits of a minor or major level
+                        (commits, True, False, True, "0.3.0-rc.1", None)
+                        for commits in (
+                            lazy_fixture(emoji_minor_commits.__name__),
+                            lazy_fixture(emoji_major_commits.__name__),
+                        )
+                    ),
+                    *(
+                        # when allow_zero_version is True, prerelease is True, & major_on_zero
+                        # is False, the version should be minor bumped, when given commits of a
+                        # minor or major level because major_on_zero = False
+                        (commits, False, False, True, "0.3.0", None)
+                        for commits in (
+                            lazy_fixture(emoji_minor_commits.__name__),
+                            lazy_fixture(emoji_major_commits.__name__),
+                        )
+                    ),
+                    # when prerelease is True, & major_on_zero is True, and allow_zero_version
+                    # is True, the version should be bumped to 1.0.0 as a prerelease version, when
+                    # given major level commits
+                    (
+                        lazy_fixture(emoji_major_commits.__name__),
+                        True,
+                        True,
+                        True,
+                        "1.0.0-rc.1",
+                        None,
+                    ),
+                    # when prerelease is False, & major_on_zero is True, and allow_zero_version
+                    # is True, the version should be bumped to 1.0.0, when given major level commits
+                    (
+                        lazy_fixture(emoji_major_commits.__name__),
+                        False,
+                        True,
+                        True,
+                        "1.0.0",
+                        None,
+                    ),
+                    *(
+                        # when prerelease is True, & allow_zero_version is False, the version should be
+                        # bumped to 1.0.0 as a prerelease version, when given any/none commits
+                        # because 0.x is no longer a valid version regardless of the major_on_zero value
+                        (commits, True, major_on_zero, False, "1.0.0-rc.1", None)
+                        for major_on_zero in (True, False)
+                        for commits in (
+                            None,
+                            lazy_fixture(emoji_chore_commits.__name__),
                             lazy_fixture(emoji_patch_commits.__name__),
-                            False,
-                            False,
-                            True,
-                            "0.2.1",
-                            None,
-                        ),
-                        *(
-                            # when allow_zero_version is True,
-                            # prerelease is True, & major_on_zero is False, the version should be
-                            # minor bumped as a prerelease version, when given commits of a minor or major level
-                            (commits, True, False, True, "0.3.0-rc.1", None)
-                            for commits in (
-                                lazy_fixture(emoji_minor_commits.__name__),
-                                lazy_fixture(emoji_major_commits.__name__),
-                            )
-                        ),
-                        *(
-                            # when allow_zero_version is True, prerelease is True, & major_on_zero
-                            # is False, the version should be minor bumped, when given commits of a
-                            # minor or major level because major_on_zero = False
-                            (commits, False, False, True, "0.3.0", None)
-                            for commits in (
-                                lazy_fixture(emoji_minor_commits.__name__),
-                                lazy_fixture(emoji_major_commits.__name__),
-                            )
-                        ),
-                        # when prerelease is True, & major_on_zero is True, and allow_zero_version
-                        # is True, the version should be bumped to 1.0.0 as a prerelease version, when
-                        # given major level commits
-                        (
+                            lazy_fixture(emoji_minor_commits.__name__),
                             lazy_fixture(emoji_major_commits.__name__),
-                            True,
-                            True,
-                            True,
-                            "1.0.0-rc.1",
-                            None,
-                        ),
-                        # when prerelease is False, & major_on_zero is True, and allow_zero_version
-                        # is True, the version should be bumped to 1.0.0, when given major level commits
-                        (
+                        )
+                    ),
+                    *(
+                        # when prerelease is True, & allow_zero_version is False, the version should be
+                        # bumped to 1.0.0, when given any/none commits
+                        # because 0.x is no longer a valid version regardless of the major_on_zero value
+                        (commits, False, major_on_zero, False, "1.0.0", None)
+                        for major_on_zero in (True, False)
+                        for commits in (
+                            lazy_fixture(emoji_patch_commits.__name__),
+                            lazy_fixture(emoji_minor_commits.__name__),
                             lazy_fixture(emoji_major_commits.__name__),
-                            False,
-                            True,
-                            True,
-                            "1.0.0",
-                            None,
-                        ),
-                        *(
-                            # when prerelease is True, & allow_zero_version is False, the version should be
-                            # bumped to 1.0.0 as a prerelease version, when given any/none commits
-                            # because 0.x is no longer a valid version regardless of the major_on_zero value
-                            (commits, True, major_on_zero, False, "1.0.0-rc.1", None)
-                            for major_on_zero in (True, False)
-                            for commits in (
-                                None,
-                                lazy_fixture(emoji_chore_commits.__name__),
-                                lazy_fixture(emoji_patch_commits.__name__),
-                                lazy_fixture(emoji_minor_commits.__name__),
-                                lazy_fixture(emoji_major_commits.__name__),
-                            )
-                        ),
-                        *(
-                            # when prerelease is True, & allow_zero_version is False, the version should be
-                            # bumped to 1.0.0, when given any/none commits
-                            # because 0.x is no longer a valid version regardless of the major_on_zero value
-                            (commits, False, major_on_zero, False, "1.0.0", None)
-                            for major_on_zero in (True, False)
-                            for commits in (
-                                lazy_fixture(emoji_patch_commits.__name__),
-                                lazy_fixture(emoji_minor_commits.__name__),
-                                lazy_fixture(emoji_major_commits.__name__),
-                            )
-                        ),
-                    ],
-                }.items()
-                for (
-                    commit_messages,
-                    prerelease,
-                    major_on_zero,
-                    allow_zero_version,
-                    next_release_version,
-                    branch_name,
-                ) in values
-            ],
+                        )
+                    ),
+                ],
+            }.items()
+            for (
+                commit_messages,
+                prerelease,
+                major_on_zero,
+                allow_zero_version,
+                next_release_version,
+                branch_name,
+            ) in values  # type: ignore[attr-defined]
         ],
     ),
 )
 def test_version_next_w_zero_dot_versions_emoji(
-    repo: Repo,
+    repo_result: BuiltRepoResult,
     commit_messages: list[str],
     prerelease: bool,
     prerelease_token: str,
@@ -2030,12 +2147,16 @@ def test_version_next_w_zero_dot_versions_emoji(
     branch_name: str,
     major_on_zero: bool,
     allow_zero_version: bool,
-    cli_runner: CliRunner,
+    run_cli: RunCliFn,
     file_in_repo: str,
     update_pyproject_toml: UpdatePyprojectTomlFn,
+    mocked_git_fetch: MagicMock,
     mocked_git_push: MagicMock,
     post_mocker: Mocker,
+    stable_now_date: GetStableDateNowFn,
 ):
+    repo = repo_result["repo"]
+
     # setup: select the branch we desire for the next bump
     if repo.active_branch.name != branch_name:
         repo.heads[branch_name].checkout()
@@ -2047,9 +2168,19 @@ def test_version_next_w_zero_dot_versions_emoji(
     update_pyproject_toml("tool.semantic_release.major_on_zero", major_on_zero)
 
     # setup: apply commits to the repo
+    stable_now_datetime = stable_now_date()
+    commit_timestamp_gen = (
+        (stable_now_datetime + timedelta(seconds=i)).isoformat(timespec="seconds")
+        for i in count(step=1)
+    )
     for commit_message in commit_messages or []:
         add_text_to_file(repo, file_in_repo)
-        repo.git.commit(m=commit_message, a=True)
+        repo.git.commit(m=commit_message, a=True, date=next(commit_timestamp_gen))
+        # Fake an automated push to remote by updating the remote tracking branch
+        repo.git.update_ref(
+            f"refs/remotes/origin/{repo.active_branch.name}",
+            repo.head.commit.hexsha,
+        )
 
     # Setup: take measurement before running the version command
     head_sha_before = repo.head.commit.hexsha
@@ -2068,12 +2199,12 @@ def test_version_next_w_zero_dot_versions_emoji(
 
     # Act
     cli_cmd = [MAIN_PROG_NAME, VERSION_SUBCMD, *prerelease_args]
-    result = cli_runner.invoke(main, cli_cmd[1:])
+    result = run_cli(cli_cmd[1:])
 
     # take measurement after running the version command
     head_after = repo.head.commit
     tags_after = {tag.name for tag in repo.tags}
-    tags_set_difference = set.difference(tags_after, tags_before)
+    tags_set_difference = cast("set[str]", set.difference(tags_after, tags_before))
 
     # Evaluate (normal release actions should have occurred when forced patch bump)
     assert_successful_exit_code(result, cli_cmd)
@@ -2084,6 +2215,7 @@ def test_version_next_w_zero_dot_versions_emoji(
     assert len(tags_set_difference) == 1  # A tag has been created
     assert f"v{next_release_version}" in tags_set_difference
 
+    assert mocked_git_fetch.call_count == 1  # fetch called to check for remote changes
     assert mocked_git_push.call_count == 2  # 1 for commit, 1 for tag
     assert post_mocker.call_count == 1  # vcs release creation occurred
 
@@ -2092,7 +2224,7 @@ def test_version_next_w_zero_dot_versions_emoji(
     str.join(
         ", ",
         [
-            "repo",
+            "repo_result",
             "commit_messages",
             "prerelease",
             "prerelease_token",
@@ -2162,13 +2294,13 @@ def test_version_next_w_zero_dot_versions_emoji(
                     allow_zero_version,
                     next_release_version,
                     branch_name,
-                ) in values
+                ) in values  # type: ignore[attr-defined]
             ],
         ],
     ),
 )
 def test_version_next_w_zero_dot_versions_no_bump_emoji(
-    repo: Repo,
+    repo_result: BuiltRepoResult,
     commit_messages: list[str],
     prerelease: bool,
     prerelease_token: str,
@@ -2176,12 +2308,16 @@ def test_version_next_w_zero_dot_versions_no_bump_emoji(
     branch_name: str,
     major_on_zero: bool,
     allow_zero_version: bool,
-    cli_runner: CliRunner,
+    run_cli: RunCliFn,
     file_in_repo: str,
     update_pyproject_toml: UpdatePyprojectTomlFn,
+    mocked_git_fetch: MagicMock,
     mocked_git_push: MagicMock,
     post_mocker: Mocker,
+    stable_now_date: GetStableDateNowFn,
 ):
+    repo = repo_result["repo"]
+
     # setup: select the branch we desire for the next bump
     if repo.active_branch.name != branch_name:
         repo.heads[branch_name].checkout()
@@ -2193,9 +2329,19 @@ def test_version_next_w_zero_dot_versions_no_bump_emoji(
     update_pyproject_toml("tool.semantic_release.major_on_zero", major_on_zero)
 
     # setup: apply commits to the repo
+    stable_now_datetime = stable_now_date()
+    commit_timestamp_gen = (
+        (stable_now_datetime + timedelta(seconds=i)).isoformat(timespec="seconds")
+        for i in count(step=1)
+    )
     for commit_message in commit_messages or []:
         add_text_to_file(repo, file_in_repo)
-        repo.git.commit(m=commit_message, a=True)
+        repo.git.commit(m=commit_message, a=True, date=next(commit_timestamp_gen))
+        # Fake an automated push to remote by updating the remote tracking branch
+        repo.git.update_ref(
+            f"refs/remotes/origin/{repo.active_branch.name}",
+            repo.head.commit.hexsha,
+        )
 
     # Setup: take measurement before running the version command
     head_sha_before = repo.head.commit.hexsha
@@ -2214,12 +2360,12 @@ def test_version_next_w_zero_dot_versions_no_bump_emoji(
 
     # Act
     cli_cmd = [MAIN_PROG_NAME, VERSION_SUBCMD, *prerelease_args]
-    result = cli_runner.invoke(main, cli_cmd[1:])
+    result = run_cli(cli_cmd[1:])
 
     # take measurement after running the version command
     head_after = repo.head.commit
     tags_after = {tag.name for tag in repo.tags}
-    tags_set_difference = set.difference(tags_after, tags_before)
+    tags_set_difference = cast("set[str]", set.difference(tags_after, tags_before))
 
     # Evaluate (no release actions should have occurred when no bump)
     assert_successful_exit_code(result, cli_cmd)
@@ -2228,6 +2374,7 @@ def test_version_next_w_zero_dot_versions_no_bump_emoji(
     # No commit has been made
     assert head_sha_before == head_after.hexsha
     assert len(tags_set_difference) == 0  # No tag created
+    assert mocked_git_fetch.call_count == 0  # no git fetch called
     assert mocked_git_push.call_count == 0  # no git push of tag or commit
     assert post_mocker.call_count == 0  # no vcs release
 
@@ -2236,7 +2383,7 @@ def test_version_next_w_zero_dot_versions_no_bump_emoji(
     str.join(
         ", ",
         [
-            "repo",
+            "repo_result",
             "commit_messages",
             "prerelease",
             "prerelease_token",
@@ -2248,261 +2395,245 @@ def test_version_next_w_zero_dot_versions_no_bump_emoji(
     ),
     xdist_sort_hack(
         [
-            (
+            pytest.param(
+                lazy_fixture(repo_fixture_name),
+                commit_messages,
+                prerelease,
+                "rc" if prerelease_token is None else prerelease_token,
+                major_on_zero,
+                allow_zero_version,
+                next_release_version,
+                "main" if branch_name is None else branch_name,
+                marks=pytest.mark.comprehensive,
+            )
+            for (repo_fixture_name, prerelease_token), values in {
                 # Latest version for repo_with_no_tags is currently 0.0.0 (default)
                 # It's biggest change type is minor, so the next version should be 0.1.0
-                # Given the major_on_zero is False and the version is starting at 0.0.0,
-                # the major level commits are limited to only causing a minor level bump
-                lazy_fixture(repo_w_no_tags_scipy_commits.__name__),
-                lazy_fixture(scipy_major_commits.__name__),
-                False,
-                "rc",
-                False,
-                True,
-                "0.1.0",
-                "main",
-            ),
-            *[
-                pytest.param(
-                    lazy_fixture(repo_fixture_name),
-                    commit_messages,
-                    prerelease,
-                    "rc" if prerelease_token is None else prerelease_token,
-                    major_on_zero,
-                    allow_zero_version,
-                    next_release_version,
-                    "main" if branch_name is None else branch_name,
-                    marks=pytest.mark.comprehensive,
-                )
-                for (repo_fixture_name, prerelease_token), values in {
-                    # Latest version for repo_with_no_tags is currently 0.0.0 (default)
-                    # It's biggest change type is minor, so the next version should be 0.1.0
-                    (
-                        repo_w_no_tags_scipy_commits.__name__,
-                        None,
-                    ): [
-                        *(
-                            # when prerelease is False, & major_on_zero is False &
-                            # allow_zero_version is True, the version should be
-                            # 0.1.0, with the given commits
-                            (commits, False, False, True, "0.1.0", None)
-                            for commits in (
-                                # Even when this test does not change anything, the base modification
-                                # will be a minor change and thus the version will be bumped to 0.1.0
-                                None,
-                                # Non version bumping commits are absorbed into the previously detected minor bump
-                                lazy_fixture(scipy_chore_commits.__name__),
-                                # Patch commits are absorbed into the previously detected minor bump
-                                lazy_fixture(scipy_patch_commits.__name__),
-                                # Minor level commits are absorbed into the previously detected minor bump
-                                lazy_fixture(scipy_minor_commits.__name__),
-                                # Given the major_on_zero is False and the version is starting at 0.0.0,
-                                # the major level commits are limited to only causing a minor level bump
-                                # lazy_fixture(scipy_major_commits.__name__), # used as default
-                            )
-                        ),
-                        # when prerelease is False, & major_on_zero is False, & allow_zero_version is True,
-                        # the version should only be minor bumped when provided major commits because
-                        # of the major_on_zero value
-                        (
-                            lazy_fixture(scipy_major_commits.__name__),
-                            False,
-                            False,
-                            True,
-                            "0.1.0",
+                (
+                    repo_w_no_tags_scipy_commits.__name__,
+                    None,
+                ): [
+                    *(
+                        # when prerelease is False, & major_on_zero is False &
+                        # allow_zero_version is True, the version should be
+                        # 0.1.0, with the given commits
+                        (commits, False, False, True, "0.1.0", None)
+                        for commits in (
+                            # Even when this test does not change anything, the base modification
+                            # will be a minor change and thus the version will be bumped to 0.1.0
                             None,
-                        ),
-                        # when prerelease is False, & major_on_zero is True & allow_zero_version is True,
-                        # the version should be major bumped when provided major commits because
-                        # of the major_on_zero value
-                        (
+                            # Non version bumping commits are absorbed into the previously detected minor bump
+                            lazy_fixture(scipy_chore_commits.__name__),
+                            # Patch commits are absorbed into the previously detected minor bump
+                            lazy_fixture(scipy_patch_commits.__name__),
+                            # Minor level commits are absorbed into the previously detected minor bump
+                            lazy_fixture(scipy_minor_commits.__name__),
+                            # Given the major_on_zero is False and the version is starting at 0.0.0,
+                            # the major level commits are limited to only causing a minor level bump
                             lazy_fixture(scipy_major_commits.__name__),
-                            False,
-                            True,
-                            True,
-                            "1.0.0",
-                            None,
-                        ),
-                        *(
-                            # when prerelease is False, & allow_zero_version is False, the version should be
-                            # 1.0.0, across the board because 0 is not a valid major version.
-                            # major_on_zero is ignored as it is not relevant but tested for completeness
-                            (commits, False, major_on_zero, False, "1.0.0", None)
-                            for major_on_zero in (True, False)
-                            for commits in (
-                                None,
-                                lazy_fixture(scipy_chore_commits.__name__),
-                                lazy_fixture(scipy_patch_commits.__name__),
-                                lazy_fixture(scipy_minor_commits.__name__),
-                                lazy_fixture(scipy_major_commits.__name__),
-                            )
-                        ),
-                    ],
-                    # Latest version for repo_with_single_branch is currently 0.1.1
-                    # Note repo_with_single_branch isn't modelled with prereleases
+                        )
+                    ),
+                    # when prerelease is False, & major_on_zero is False, & allow_zero_version is True,
+                    # the version should only be minor bumped when provided major commits because
+                    # of the major_on_zero value
                     (
-                        repo_w_trunk_only_scipy_commits.__name__,
+                        lazy_fixture(scipy_major_commits.__name__),
+                        False,
+                        False,
+                        True,
+                        "0.1.0",
                         None,
-                    ): [
-                        *(
-                            # when prerelease must be False, and allow_zero_version is True,
-                            # the version is patch bumped because of the patch level commits
-                            # regardless of the major_on_zero value
-                            (
-                                lazy_fixture(scipy_patch_commits.__name__),
-                                False,
-                                major_on_zero,
-                                True,
-                                "0.1.2",
-                                None,
-                            )
-                            for major_on_zero in (True, False)
-                        ),
-                        *(
-                            # when prerelease must be False, and allow_zero_version is True,
-                            # the version is minor bumped because of the major_on_zero value=False
-                            (commits, False, False, True, "0.2.0", None)
-                            for commits in (
-                                lazy_fixture(scipy_minor_commits.__name__),
-                                lazy_fixture(scipy_major_commits.__name__),
-                            )
-                        ),
+                    ),
+                    # when prerelease is False, & major_on_zero is True & allow_zero_version is True,
+                    # the version should be major bumped when provided major commits because
+                    # of the major_on_zero value
+                    (
+                        lazy_fixture(scipy_major_commits.__name__),
+                        False,
+                        True,
+                        True,
+                        "1.0.0",
+                        None,
+                    ),
+                    *(
+                        # when prerelease is False, & allow_zero_version is False, the version should be
+                        # 1.0.0, across the board because 0 is not a valid major version.
+                        # major_on_zero is ignored as it is not relevant but tested for completeness
+                        (commits, False, major_on_zero, False, "1.0.0", None)
+                        for major_on_zero in (True, False)
+                        for commits in (
+                            None,
+                            lazy_fixture(scipy_chore_commits.__name__),
+                            lazy_fixture(scipy_patch_commits.__name__),
+                            lazy_fixture(scipy_minor_commits.__name__),
+                            lazy_fixture(scipy_major_commits.__name__),
+                        )
+                    ),
+                ],
+                # Latest version for repo_with_single_branch is currently 0.1.1
+                # Note repo_with_single_branch isn't modelled with prereleases
+                (
+                    repo_w_trunk_only_scipy_commits.__name__,
+                    None,
+                ): [
+                    *(
                         # when prerelease must be False, and allow_zero_version is True,
-                        # but the major_on_zero is True, then when a major level commit is given,
-                        # the version should be bumped to the next major version
+                        # the version is patch bumped because of the patch level commits
+                        # regardless of the major_on_zero value
                         (
-                            lazy_fixture(scipy_major_commits.__name__),
+                            lazy_fixture(scipy_patch_commits.__name__),
                             False,
+                            major_on_zero,
                             True,
-                            True,
-                            "1.0.0",
+                            "0.1.2",
                             None,
-                        ),
-                        *(
-                            # when prerelease must be False, & allow_zero_version is False, the version should be
-                            # 1.0.0, with any change regardless of major_on_zero
-                            (commits, False, major_on_zero, False, "1.0.0", None)
-                            for major_on_zero in (True, False)
-                            for commits in (
-                                None,
-                                lazy_fixture(scipy_chore_commits.__name__),
-                                lazy_fixture(scipy_patch_commits.__name__),
-                                lazy_fixture(scipy_minor_commits.__name__),
-                                lazy_fixture(scipy_major_commits.__name__),
-                            )
-                        ),
-                    ],
-                    # Latest version for repo_with_single_branch_and_prereleases is
-                    # currently 0.2.0
+                        )
+                        for major_on_zero in (True, False)
+                    ),
+                    *(
+                        # when prerelease must be False, and allow_zero_version is True,
+                        # the version is minor bumped because of the major_on_zero value=False
+                        (commits, False, False, True, "0.2.0", None)
+                        for commits in (
+                            lazy_fixture(scipy_minor_commits.__name__),
+                            lazy_fixture(scipy_major_commits.__name__),
+                        )
+                    ),
+                    # when prerelease must be False, and allow_zero_version is True,
+                    # but the major_on_zero is True, then when a major level commit is given,
+                    # the version should be bumped to the next major version
                     (
-                        repo_w_trunk_only_n_prereleases_scipy_commits.__name__,
+                        lazy_fixture(scipy_major_commits.__name__),
+                        False,
+                        True,
+                        True,
+                        "1.0.0",
                         None,
-                    ): [
-                        # when allow_zero_version is True,
-                        # prerelease is False, & major_on_zero is False, the version should be
-                        # patch bumped as a prerelease version, when given patch level commits
-                        (
+                    ),
+                    *(
+                        # when prerelease must be False, & allow_zero_version is False, the version should be
+                        # 1.0.0, with any change regardless of major_on_zero
+                        (commits, False, major_on_zero, False, "1.0.0", None)
+                        for major_on_zero in (True, False)
+                        for commits in (
+                            None,
+                            lazy_fixture(scipy_chore_commits.__name__),
                             lazy_fixture(scipy_patch_commits.__name__),
-                            True,
-                            False,
-                            True,
-                            "0.2.1-rc.1",
-                            None,
-                        ),
+                            lazy_fixture(scipy_minor_commits.__name__),
+                            lazy_fixture(scipy_major_commits.__name__),
+                        )
+                    ),
+                ],
+                # Latest version for repo_with_single_branch_and_prereleases is
+                # currently 0.2.0
+                (
+                    repo_w_trunk_only_n_prereleases_scipy_commits.__name__,
+                    None,
+                ): [
+                    # when allow_zero_version is True,
+                    # prerelease is False, & major_on_zero is False, the version should be
+                    # patch bumped as a prerelease version, when given patch level commits
+                    (
+                        lazy_fixture(scipy_patch_commits.__name__),
+                        True,
+                        False,
+                        True,
+                        "0.2.1-rc.1",
+                        None,
+                    ),
+                    # when allow_zero_version is True,
+                    # prerelease is False, & major_on_zero is False, the version should be
+                    # patch bumped, when given patch level commits
+                    (
+                        lazy_fixture(scipy_patch_commits.__name__),
+                        False,
+                        False,
+                        True,
+                        "0.2.1",
+                        None,
+                    ),
+                    *(
                         # when allow_zero_version is True,
-                        # prerelease is False, & major_on_zero is False, the version should be
-                        # patch bumped, when given patch level commits
-                        (
+                        # prerelease is True, & major_on_zero is False, the version should be
+                        # minor bumped as a prerelease version, when given commits of a minor or major level
+                        (commits, True, False, True, "0.3.0-rc.1", None)
+                        for commits in (
+                            lazy_fixture(scipy_minor_commits.__name__),
+                            lazy_fixture(scipy_major_commits.__name__),
+                        )
+                    ),
+                    *(
+                        # when allow_zero_version is True, prerelease is True, & major_on_zero
+                        # is False, the version should be minor bumped, when given commits of a
+                        # minor or major level because major_on_zero = False
+                        (commits, False, False, True, "0.3.0", None)
+                        for commits in (
+                            lazy_fixture(scipy_minor_commits.__name__),
+                            lazy_fixture(scipy_major_commits.__name__),
+                        )
+                    ),
+                    # when prerelease is True, & major_on_zero is True, and allow_zero_version
+                    # is True, the version should be bumped to 1.0.0 as a prerelease version, when
+                    # given major level commits
+                    (
+                        lazy_fixture(scipy_major_commits.__name__),
+                        True,
+                        True,
+                        True,
+                        "1.0.0-rc.1",
+                        None,
+                    ),
+                    # when prerelease is False, & major_on_zero is True, and allow_zero_version
+                    # is True, the version should be bumped to 1.0.0, when given major level commits
+                    (
+                        lazy_fixture(scipy_major_commits.__name__),
+                        False,
+                        True,
+                        True,
+                        "1.0.0",
+                        None,
+                    ),
+                    *(
+                        # when prerelease is True, & allow_zero_version is False, the version should be
+                        # bumped to 1.0.0 as a prerelease version, when given any/none commits
+                        # because 0.x is no longer a valid version regardless of the major_on_zero value
+                        (commits, True, major_on_zero, False, "1.0.0-rc.1", None)
+                        for major_on_zero in (True, False)
+                        for commits in (
+                            None,
+                            lazy_fixture(scipy_chore_commits.__name__),
                             lazy_fixture(scipy_patch_commits.__name__),
-                            False,
-                            False,
-                            True,
-                            "0.2.1",
-                            None,
-                        ),
-                        *(
-                            # when allow_zero_version is True,
-                            # prerelease is True, & major_on_zero is False, the version should be
-                            # minor bumped as a prerelease version, when given commits of a minor or major level
-                            (commits, True, False, True, "0.3.0-rc.1", None)
-                            for commits in (
-                                lazy_fixture(scipy_minor_commits.__name__),
-                                lazy_fixture(scipy_major_commits.__name__),
-                            )
-                        ),
-                        *(
-                            # when allow_zero_version is True, prerelease is True, & major_on_zero
-                            # is False, the version should be minor bumped, when given commits of a
-                            # minor or major level because major_on_zero = False
-                            (commits, False, False, True, "0.3.0", None)
-                            for commits in (
-                                lazy_fixture(scipy_minor_commits.__name__),
-                                lazy_fixture(scipy_major_commits.__name__),
-                            )
-                        ),
-                        # when prerelease is True, & major_on_zero is True, and allow_zero_version
-                        # is True, the version should be bumped to 1.0.0 as a prerelease version, when
-                        # given major level commits
-                        (
+                            lazy_fixture(scipy_minor_commits.__name__),
                             lazy_fixture(scipy_major_commits.__name__),
-                            True,
-                            True,
-                            True,
-                            "1.0.0-rc.1",
-                            None,
-                        ),
-                        # when prerelease is False, & major_on_zero is True, and allow_zero_version
-                        # is True, the version should be bumped to 1.0.0, when given major level commits
-                        (
+                        )
+                    ),
+                    *(
+                        # when prerelease is True, & allow_zero_version is False, the version should be
+                        # bumped to 1.0.0, when given any/none commits
+                        # because 0.x is no longer a valid version regardless of the major_on_zero value
+                        (commits, False, major_on_zero, False, "1.0.0", None)
+                        for major_on_zero in (True, False)
+                        for commits in (
+                            lazy_fixture(scipy_patch_commits.__name__),
+                            lazy_fixture(scipy_minor_commits.__name__),
                             lazy_fixture(scipy_major_commits.__name__),
-                            False,
-                            True,
-                            True,
-                            "1.0.0",
-                            None,
-                        ),
-                        *(
-                            # when prerelease is True, & allow_zero_version is False, the version should be
-                            # bumped to 1.0.0 as a prerelease version, when given any/none commits
-                            # because 0.x is no longer a valid version regardless of the major_on_zero value
-                            (commits, True, major_on_zero, False, "1.0.0-rc.1", None)
-                            for major_on_zero in (True, False)
-                            for commits in (
-                                None,
-                                lazy_fixture(scipy_chore_commits.__name__),
-                                lazy_fixture(scipy_patch_commits.__name__),
-                                lazy_fixture(scipy_minor_commits.__name__),
-                                lazy_fixture(scipy_major_commits.__name__),
-                            )
-                        ),
-                        *(
-                            # when prerelease is True, & allow_zero_version is False, the version should be
-                            # bumped to 1.0.0, when given any/none commits
-                            # because 0.x is no longer a valid version regardless of the major_on_zero value
-                            (commits, False, major_on_zero, False, "1.0.0", None)
-                            for major_on_zero in (True, False)
-                            for commits in (
-                                lazy_fixture(scipy_patch_commits.__name__),
-                                lazy_fixture(scipy_minor_commits.__name__),
-                                lazy_fixture(scipy_major_commits.__name__),
-                            )
-                        ),
-                    ],
-                }.items()
-                for (
-                    commit_messages,
-                    prerelease,
-                    major_on_zero,
-                    allow_zero_version,
-                    next_release_version,
-                    branch_name,
-                ) in values
-            ],
+                        )
+                    ),
+                ],
+            }.items()
+            for (
+                commit_messages,
+                prerelease,
+                major_on_zero,
+                allow_zero_version,
+                next_release_version,
+                branch_name,
+            ) in values  # type: ignore[attr-defined]
         ],
     ),
 )
 def test_version_next_w_zero_dot_versions_scipy(
-    repo: Repo,
+    repo_result: BuiltRepoResult,
     commit_messages: list[str],
     prerelease: bool,
     prerelease_token: str,
@@ -2510,12 +2641,16 @@ def test_version_next_w_zero_dot_versions_scipy(
     branch_name: str,
     major_on_zero: bool,
     allow_zero_version: bool,
-    cli_runner: CliRunner,
+    run_cli: RunCliFn,
     file_in_repo: str,
     update_pyproject_toml: UpdatePyprojectTomlFn,
+    mocked_git_fetch: MagicMock,
     mocked_git_push: MagicMock,
     post_mocker: Mocker,
+    stable_now_date: GetStableDateNowFn,
 ):
+    repo = repo_result["repo"]
+
     # setup: select the branch we desire for the next bump
     if repo.active_branch.name != branch_name:
         repo.heads[branch_name].checkout()
@@ -2527,9 +2662,19 @@ def test_version_next_w_zero_dot_versions_scipy(
     update_pyproject_toml("tool.semantic_release.major_on_zero", major_on_zero)
 
     # setup: apply commits to the repo
+    stable_now_datetime = stable_now_date()
+    commit_timestamp_gen = (
+        (stable_now_datetime + timedelta(seconds=i)).isoformat(timespec="seconds")
+        for i in count(step=1)
+    )
     for commit_message in commit_messages or []:
         add_text_to_file(repo, file_in_repo)
-        repo.git.commit(m=commit_message, a=True)
+        repo.git.commit(m=commit_message, a=True, date=next(commit_timestamp_gen))
+        # Fake an automated push to remote by updating the remote tracking branch
+        repo.git.update_ref(
+            f"refs/remotes/origin/{repo.active_branch.name}",
+            repo.head.commit.hexsha,
+        )
 
     # Setup: take measurement before running the version command
     head_sha_before = repo.head.commit.hexsha
@@ -2548,12 +2693,12 @@ def test_version_next_w_zero_dot_versions_scipy(
 
     # Act
     cli_cmd = [MAIN_PROG_NAME, VERSION_SUBCMD, *prerelease_args]
-    result = cli_runner.invoke(main, cli_cmd[1:])
+    result = run_cli(cli_cmd[1:])
 
     # take measurement after running the version command
     head_after = repo.head.commit
     tags_after = {tag.name for tag in repo.tags}
-    tags_set_difference = set.difference(tags_after, tags_before)
+    tags_set_difference = cast("set[str]", set.difference(tags_after, tags_before))
 
     # Evaluate (normal release actions should have occurred when forced patch bump)
     assert_successful_exit_code(result, cli_cmd)
@@ -2564,6 +2709,7 @@ def test_version_next_w_zero_dot_versions_scipy(
     assert len(tags_set_difference) == 1  # A tag has been created
     assert f"v{next_release_version}" in tags_set_difference
 
+    assert mocked_git_fetch.call_count == 1  # fetch called to check for remote changes
     assert mocked_git_push.call_count == 2  # 1 for commit, 1 for tag
     assert post_mocker.call_count == 1  # vcs release creation occurred
 
@@ -2572,7 +2718,7 @@ def test_version_next_w_zero_dot_versions_scipy(
     str.join(
         ", ",
         [
-            "repo",
+            "repo_result",
             "commit_messages",
             "prerelease",
             "prerelease_token",
@@ -2642,13 +2788,13 @@ def test_version_next_w_zero_dot_versions_scipy(
                     allow_zero_version,
                     next_release_version,
                     branch_name,
-                ) in values
+                ) in values  # type: ignore[attr-defined]
             ],
         ],
     ),
 )
 def test_version_next_w_zero_dot_versions_no_bump_scipy(
-    repo: Repo,
+    repo_result: BuiltRepoResult,
     commit_messages: list[str],
     prerelease: bool,
     prerelease_token: str,
@@ -2656,12 +2802,16 @@ def test_version_next_w_zero_dot_versions_no_bump_scipy(
     branch_name: str,
     major_on_zero: bool,
     allow_zero_version: bool,
-    cli_runner: CliRunner,
+    run_cli: RunCliFn,
     file_in_repo: str,
     update_pyproject_toml: UpdatePyprojectTomlFn,
+    mocked_git_fetch: MagicMock,
     mocked_git_push: MagicMock,
     post_mocker: Mocker,
+    stable_now_date: GetStableDateNowFn,
 ):
+    repo = repo_result["repo"]
+
     # setup: select the branch we desire for the next bump
     if repo.active_branch.name != branch_name:
         repo.heads[branch_name].checkout()
@@ -2673,9 +2823,19 @@ def test_version_next_w_zero_dot_versions_no_bump_scipy(
     update_pyproject_toml("tool.semantic_release.major_on_zero", major_on_zero)
 
     # setup: apply commits to the repo
+    stable_now_datetime = stable_now_date()
+    commit_timestamp_gen = (
+        (stable_now_datetime + timedelta(seconds=i)).isoformat(timespec="seconds")
+        for i in count(step=1)
+    )
     for commit_message in commit_messages or []:
         add_text_to_file(repo, file_in_repo)
-        repo.git.commit(m=commit_message, a=True)
+        repo.git.commit(m=commit_message, a=True, date=next(commit_timestamp_gen))
+        # Fake an automated push to remote by updating the remote tracking branch
+        repo.git.update_ref(
+            f"refs/remotes/origin/{repo.active_branch.name}",
+            repo.head.commit.hexsha,
+        )
 
     # Setup: take measurement before running the version command
     head_sha_before = repo.head.commit.hexsha
@@ -2694,12 +2854,12 @@ def test_version_next_w_zero_dot_versions_no_bump_scipy(
 
     # Act
     cli_cmd = [MAIN_PROG_NAME, VERSION_SUBCMD, *prerelease_args]
-    result = cli_runner.invoke(main, cli_cmd[1:])
+    result = run_cli(cli_cmd[1:])
 
     # take measurement after running the version command
     head_after = repo.head.commit
     tags_after = {tag.name for tag in repo.tags}
-    tags_set_difference = set.difference(tags_after, tags_before)
+    tags_set_difference = cast("set[str]", set.difference(tags_after, tags_before))
 
     # Evaluate (no release actions should have occurred when no bump)
     assert_successful_exit_code(result, cli_cmd)
@@ -2708,6 +2868,7 @@ def test_version_next_w_zero_dot_versions_no_bump_scipy(
     # No commit has been made
     assert head_sha_before == head_after.hexsha
     assert len(tags_set_difference) == 0  # No tag created
+    assert mocked_git_fetch.call_count == 0  # no git fetch called
     assert mocked_git_push.call_count == 0  # no git push of tag or commit
     assert post_mocker.call_count == 0  # no vcs release
 
@@ -2716,7 +2877,7 @@ def test_version_next_w_zero_dot_versions_no_bump_scipy(
     str.join(
         " ,",
         [
-            "repo",
+            "repo_result",
             "commit_parser",
             "commit_messages",
             "prerelease",
@@ -2733,7 +2894,7 @@ def test_version_next_w_zero_dot_versions_no_bump_scipy(
                 # Latest version for repo_w_initial_commit is currently 0.0.0
                 # with no changes made it should be 0.0.0
                 lazy_fixture(repo_w_initial_commit.__name__),
-                AngularCommitParser.__name__.replace("CommitParser", "").lower(),
+                ConventionalCommitParser.__name__.replace("CommitParser", "").lower(),
                 None,
                 False,
                 "rc",
@@ -2768,11 +2929,11 @@ def test_version_next_w_zero_dot_versions_no_bump_scipy(
                             for major_on_zero in (True, False)
                             for commits, parser in (
                                 # No commits added, so base is just initial commit at 0.0.0
-                                (None, AngularCommitParser.__name__),
+                                (None, ConventionalCommitParser.__name__),
                                 # Chore like commits also don't trigger a version bump so it stays 0.0.0
                                 (
-                                    lazy_fixture(angular_chore_commits.__name__),
-                                    AngularCommitParser.__name__,
+                                    lazy_fixture(conventional_chore_commits.__name__),
+                                    ConventionalCommitParser.__name__,
                                 ),
                                 (
                                     lazy_fixture(emoji_chore_commits.__name__),
@@ -2792,8 +2953,8 @@ def test_version_next_w_zero_dot_versions_no_bump_scipy(
                                 # a patch bump as a prerelease version, because of the patch level commits
                                 # major_on_zero is irrelevant here as we are only applying patch commits
                                 (
-                                    lazy_fixture(angular_patch_commits.__name__),
-                                    AngularCommitParser.__name__,
+                                    lazy_fixture(conventional_patch_commits.__name__),
+                                    ConventionalCommitParser.__name__,
                                 ),
                                 (
                                     lazy_fixture(emoji_patch_commits.__name__),
@@ -2813,8 +2974,8 @@ def test_version_next_w_zero_dot_versions_no_bump_scipy(
                                 # a patch bump because of the patch commits added
                                 # major_on_zero is irrelevant here as we are only applying patch commits
                                 (
-                                    lazy_fixture(angular_patch_commits.__name__),
-                                    AngularCommitParser.__name__,
+                                    lazy_fixture(conventional_patch_commits.__name__),
+                                    ConventionalCommitParser.__name__,
                                 ),
                                 (
                                     lazy_fixture(emoji_patch_commits.__name__),
@@ -2832,8 +2993,8 @@ def test_version_next_w_zero_dot_versions_no_bump_scipy(
                                 # when prerelease is False, & major_on_zero is False, the version should be
                                 # a minor bump because of the minor commits added
                                 (
-                                    lazy_fixture(angular_minor_commits.__name__),
-                                    AngularCommitParser.__name__,
+                                    lazy_fixture(conventional_minor_commits.__name__),
+                                    ConventionalCommitParser.__name__,
                                 ),
                                 (
                                     lazy_fixture(emoji_minor_commits.__name__),
@@ -2846,8 +3007,8 @@ def test_version_next_w_zero_dot_versions_no_bump_scipy(
                                 # Given the major_on_zero is False and the version is starting at 0.0.0,
                                 # the major level commits are limited to only causing a minor level bump
                                 (
-                                    lazy_fixture(angular_major_commits.__name__),
-                                    AngularCommitParser.__name__,
+                                    lazy_fixture(conventional_major_commits.__name__),
+                                    ConventionalCommitParser.__name__,
                                 ),
                                 (
                                     lazy_fixture(emoji_major_commits.__name__),
@@ -2867,8 +3028,8 @@ def test_version_next_w_zero_dot_versions_no_bump_scipy(
                                 # the version should be a minor bump of 0.0.0
                                 # because of the minor commits added and zero version is allowed
                                 (
-                                    lazy_fixture(angular_minor_commits.__name__),
-                                    AngularCommitParser.__name__,
+                                    lazy_fixture(conventional_minor_commits.__name__),
+                                    ConventionalCommitParser.__name__,
                                 ),
                                 (
                                     lazy_fixture(emoji_minor_commits.__name__),
@@ -2881,8 +3042,8 @@ def test_version_next_w_zero_dot_versions_no_bump_scipy(
                                 # Given the major_on_zero is False and the version is starting at 0.0.0,
                                 # the major level commits are limited to only causing a minor level bump
                                 (
-                                    lazy_fixture(angular_major_commits.__name__),
-                                    AngularCommitParser.__name__,
+                                    lazy_fixture(conventional_major_commits.__name__),
+                                    ConventionalCommitParser.__name__,
                                 ),
                                 (
                                     lazy_fixture(emoji_major_commits.__name__),
@@ -2903,22 +3064,22 @@ def test_version_next_w_zero_dot_versions_no_bump_scipy(
                             for major_on_zero in (True, False)
                             for commits, parser in (
                                 # parser doesn't matter here as long as it detects a NO_RELEASE on Initial Commit
-                                (None, AngularCommitParser.__name__),
+                                (None, ConventionalCommitParser.__name__),
                                 (
-                                    lazy_fixture(angular_chore_commits.__name__),
-                                    AngularCommitParser.__name__,
+                                    lazy_fixture(conventional_chore_commits.__name__),
+                                    ConventionalCommitParser.__name__,
                                 ),
                                 (
-                                    lazy_fixture(angular_patch_commits.__name__),
-                                    AngularCommitParser.__name__,
+                                    lazy_fixture(conventional_patch_commits.__name__),
+                                    ConventionalCommitParser.__name__,
                                 ),
                                 (
-                                    lazy_fixture(angular_minor_commits.__name__),
-                                    AngularCommitParser.__name__,
+                                    lazy_fixture(conventional_minor_commits.__name__),
+                                    ConventionalCommitParser.__name__,
                                 ),
                                 (
-                                    lazy_fixture(angular_major_commits.__name__),
-                                    AngularCommitParser.__name__,
+                                    lazy_fixture(conventional_major_commits.__name__),
+                                    ConventionalCommitParser.__name__,
                                 ),
                                 (
                                     lazy_fixture(emoji_chore_commits.__name__),
@@ -2962,22 +3123,22 @@ def test_version_next_w_zero_dot_versions_no_bump_scipy(
                             (commits, parser, False, major_on_zero, False, "1.0.0")
                             for major_on_zero in (True, False)
                             for commits, parser in (
-                                (None, AngularCommitParser.__name__),
+                                (None, ConventionalCommitParser.__name__),
                                 (
-                                    lazy_fixture(angular_chore_commits.__name__),
-                                    AngularCommitParser.__name__,
+                                    lazy_fixture(conventional_chore_commits.__name__),
+                                    ConventionalCommitParser.__name__,
                                 ),
                                 (
-                                    lazy_fixture(angular_patch_commits.__name__),
-                                    AngularCommitParser.__name__,
+                                    lazy_fixture(conventional_patch_commits.__name__),
+                                    ConventionalCommitParser.__name__,
                                 ),
                                 (
-                                    lazy_fixture(angular_minor_commits.__name__),
-                                    AngularCommitParser.__name__,
+                                    lazy_fixture(conventional_minor_commits.__name__),
+                                    ConventionalCommitParser.__name__,
                                 ),
                                 (
-                                    lazy_fixture(angular_major_commits.__name__),
-                                    AngularCommitParser.__name__,
+                                    lazy_fixture(conventional_major_commits.__name__),
+                                    ConventionalCommitParser.__name__,
                                 ),
                                 (
                                     lazy_fixture(emoji_chore_commits.__name__),
@@ -3022,13 +3183,13 @@ def test_version_next_w_zero_dot_versions_no_bump_scipy(
                     major_on_zero,
                     allow_zero_version,
                     next_release_version,
-                ) in values
+                ) in values  # type: ignore[attr-defined]
             ],
         ],
     ),
 )
 def test_version_next_w_zero_dot_versions_minimums(
-    repo: Repo,
+    repo_result: BuiltRepoResult,
     commit_parser: str,
     commit_messages: list[str],
     prerelease: bool,
@@ -3037,12 +3198,16 @@ def test_version_next_w_zero_dot_versions_minimums(
     branch_name: str,
     major_on_zero: bool,
     allow_zero_version: bool,
-    cli_runner: CliRunner,
+    run_cli: RunCliFn,
     file_in_repo: str,
     update_pyproject_toml: UpdatePyprojectTomlFn,
+    mocked_git_fetch: MagicMock,
     mocked_git_push: MagicMock,
     post_mocker: Mocker,
+    stable_now_date: GetStableDateNowFn,
 ):
+    repo = repo_result["repo"]
+
     # setup: select the branch we desire for the next bump
     if repo.active_branch.name != branch_name:
         repo.heads[branch_name].checkout()
@@ -3055,9 +3220,19 @@ def test_version_next_w_zero_dot_versions_minimums(
     update_pyproject_toml("tool.semantic_release.major_on_zero", major_on_zero)
 
     # setup: apply commits to the repo
+    stable_now_datetime = stable_now_date()
+    commit_timestamp_gen = (
+        (stable_now_datetime + timedelta(seconds=i)).isoformat(timespec="seconds")
+        for i in count(step=1)
+    )
     for commit_message in commit_messages or []:
         add_text_to_file(repo, file_in_repo)
-        repo.git.commit(m=commit_message, a=True)
+        repo.git.commit(m=commit_message, a=True, date=next(commit_timestamp_gen))
+        # Fake an automated push to remote by updating the remote tracking branch
+        repo.git.update_ref(
+            f"refs/remotes/origin/{repo.active_branch.name}",
+            repo.head.commit.hexsha,
+        )
 
     # Setup: take measurement before running the version command
     head_sha_before = repo.head.commit.hexsha
@@ -3076,12 +3251,12 @@ def test_version_next_w_zero_dot_versions_minimums(
 
     # Act
     cli_cmd = [MAIN_PROG_NAME, VERSION_SUBCMD, *prerelease_args]
-    result = cli_runner.invoke(main, cli_cmd[1:])
+    result = run_cli(cli_cmd[1:])
 
     # take measurement after running the version command
     head_after = repo.head.commit
     tags_after = {tag.name for tag in repo.tags}
-    tags_set_difference = set.difference(tags_after, tags_before)
+    tags_set_difference = cast("set[str]", set.difference(tags_after, tags_before))
 
     # Evaluate (normal release actions should have occurred when forced patch bump)
     assert_successful_exit_code(result, cli_cmd)
@@ -3092,5 +3267,6 @@ def test_version_next_w_zero_dot_versions_minimums(
     assert len(tags_set_difference) == 1  # A tag has been created
     assert f"v{next_release_version}" in tags_set_difference
 
+    assert mocked_git_fetch.call_count == 1  # fetch called to check for remote changes
     assert mocked_git_push.call_count == 2  # 1 for commit, 1 for tag
     assert post_mocker.call_count == 1  # vcs release creation occurred

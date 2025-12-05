@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 import os
 import subprocess
 import sys
@@ -11,7 +10,7 @@ from typing import TYPE_CHECKING
 import click
 import shellingham  # type: ignore[import]
 from click_option_group import MutuallyExclusiveOptionGroup, optgroup
-from git import Repo
+from git import GitCommandError, Repo
 from requests import HTTPError
 
 from semantic_release.changelog.release_history import ReleaseHistory
@@ -19,35 +18,43 @@ from semantic_release.cli.changelog_writer import (
     generate_release_notes,
     write_changelog_files,
 )
-from semantic_release.cli.github_actions_output import VersionGitHubActionsOutput
+from semantic_release.cli.github_actions_output import (
+    PersistenceMode,
+    VersionGitHubActionsOutput,
+)
 from semantic_release.cli.util import noop_report, rprint
 from semantic_release.const import DEFAULT_SHELL, DEFAULT_VERSION
 from semantic_release.enums import LevelBump
 from semantic_release.errors import (
     BuildDistributionsError,
+    DetachedHeadGitError,
     GitCommitEmptyIndexError,
+    GitFetchError,
+    InternalError,
+    LocalGitError,
     UnexpectedResponse,
+    UnknownUpstreamBranchError,
+    UpstreamBranchChangedError,
 )
 from semantic_release.gitproject import GitProject
+from semantic_release.globals import logger
+from semantic_release.hvcs.github import Github
 from semantic_release.hvcs.remote_hvcs_base import RemoteHvcsBase
 from semantic_release.version.algorithm import (
     next_version,
     tags_and_versions,
 )
 from semantic_release.version.translator import VersionTranslator
-from semantic_release.version.version import Version
 
 if TYPE_CHECKING:  # pragma: no cover
     from pathlib import Path
-    from typing import Iterable, Mapping
+    from typing import Mapping, Sequence
 
     from git.refs.tag import Tag
 
     from semantic_release.cli.cli_context import CliContextObj
-    from semantic_release.version.declaration import VersionDeclarationABC
-
-
-log = logging.getLogger(__name__)
+    from semantic_release.version.declaration import IVersionReplacer
+    from semantic_release.version.version import Version
 
 
 def is_forced_prerelease(
@@ -61,10 +68,10 @@ def is_forced_prerelease(
     Otherwise (``force_level is None``) use the value of ``prerelease``
     """
     local_vars = list(locals().items())
-    log.debug(
+    logger.debug(
         "%s: %s",
         is_forced_prerelease.__name__,
-        ", ".join(f"{k} = {v}" for k, v in local_vars),
+        str.join(", ", iter(f"{k} = {v}" for k, v in local_vars)),
     )
     return (
         as_prerelease
@@ -73,10 +80,13 @@ def is_forced_prerelease(
     )
 
 
-def last_released(repo_dir: Path, tag_format: str) -> tuple[Tag, Version] | None:
+def last_released(
+    repo_dir: Path, tag_format: str, add_partial_tags: bool = False
+) -> tuple[Tag, Version] | None:
     with Repo(str(repo_dir)) as git_repo:
         ts_and_vs = tags_and_versions(
-            git_repo.tags, VersionTranslator(tag_format=tag_format)
+            git_repo.tags,
+            VersionTranslator(tag_format=tag_format, add_partial_tags=add_partial_tags),
         )
 
     return ts_and_vs[0] if ts_and_vs else None
@@ -90,7 +100,18 @@ def version_from_forced_level(
 
     # If we have no tags, return the default version
     if not ts_and_vs:
-        return Version.parse(DEFAULT_VERSION).bump(forced_level_bump)
+        # Since the translator is configured by the user, we can't guarantee that it will
+        # be able to parse the default version. So we first cast it to a tag using the default
+        # value and the users configured tag format, then parse it back to a version object
+        default_initial_version = translator.from_tag(
+            translator.str_to_tag(DEFAULT_VERSION)
+        )
+        if default_initial_version is None:
+            # This should never happen, but if it does, it's a bug
+            raise InternalError(
+                "Translator was unable to parse the embedded default version"
+            )
+        return default_initial_version.bump(forced_level_bump)
 
     _, latest_version = ts_and_vs[0]
     if forced_level_bump is not LevelBump.PRERELEASE_REVISION:
@@ -123,28 +144,39 @@ def version_from_forced_level(
 
 def apply_version_to_source_files(
     repo_dir: Path,
-    version_declarations: Iterable[VersionDeclarationABC],
+    version_declarations: Sequence[IVersionReplacer],
     version: Version,
     noop: bool = False,
 ) -> list[str]:
+    if len(version_declarations) < 1:
+        return []
+
+    if not noop:
+        logger.debug("Updating version %s in repository files...", version)
+
     paths = [
-        str(declaration.path.resolve().relative_to(repo_dir))
-        for declaration in version_declarations
+        decl.update_file_w_version(new_version=version, noop=noop)
+        for decl in version_declarations
+    ]
+
+    repo_filepaths = [
+        str(updated_file.relative_to(repo_dir))
+        for updated_file in paths
+        if updated_file is not None
     ]
 
     if noop:
         noop_report(
-            "would have updated versions in the following paths:"
-            + "".join(f"\n    {path}" for path in paths)
+            str.join(
+                "",
+                [
+                    "would have updated versions in the following paths:",
+                    *[f"\n    {filepath}" for filepath in repo_filepaths],
+                ],
+            )
         )
-        return paths
 
-    log.debug("writing version %s to source paths %s", version, paths)
-    for declaration in version_declarations:
-        new_content = declaration.replace(new_version=version)
-        declaration.path.write_text(new_content)
-
-    return paths
+    return repo_filepaths
 
 
 def shell(
@@ -154,8 +186,8 @@ def shell(
     try:
         shell, _ = shellingham.detect_shell()
     except shellingham.ShellDetectionFailure:
-        log.warning("failed to detect shell, using default shell: %s", DEFAULT_SHELL)
-        log.debug("stack trace", exc_info=True)
+        logger.warning("failed to detect shell, using default shell: %s", DEFAULT_SHELL)
+        logger.debug("stack trace", exc_info=True)
         shell = DEFAULT_SHELL
 
     if not shell:
@@ -204,6 +236,7 @@ def get_windows_env() -> Mapping[str, str | None]:
             "SYSTEMROOT",
             "TEMP",
             "TMP",
+            "USERNAME",  # must include for python getpass.getuser() on windows
             "USERPROFILE",
             "USERSID",
             "WINDIR",
@@ -234,7 +267,7 @@ def build_distributions(
         noop_report(f"would have run the build_command {build_command}")
         return
 
-    log.info("Running build command %s", build_command)
+    logger.info("Running build command %s", build_command)
     rprint(f"[bold green]:hammer_and_wrench: Running build command: {build_command}")
 
     build_env_vars: dict[str, str] = dict(
@@ -268,8 +301,8 @@ def build_distributions(
         shell(build_command, env=build_env_vars, check=True)
         rprint("[bold green]Build completed successfully!")
     except subprocess.CalledProcessError as exc:
-        log.exception(exc)
-        log.error("Build command failed with exit code %s", exc.returncode)  # noqa: TRY400
+        logger.exception(exc)
+        logger.error("Build command failed with exit code %s", exc.returncode)  # noqa: TRY400
         raise BuildDistributionsError from exc
 
 
@@ -424,9 +457,13 @@ def version(  # noqa: C901
     if print_last_released or print_last_released_tag:
         # TODO: get tag format a better way
         if not (
-            last_release := last_released(config.repo_dir, tag_format=config.tag_format)
+            last_release := last_released(
+                config.repo_dir,
+                tag_format=config.tag_format,
+                add_partial_tags=config.add_partial_tags,
+            )
         ):
-            log.warning("No release tags found.")
+            logger.warning("No release tags found.")
             return
 
         click.echo(last_release[0] if print_last_released_tag else last_release[1])
@@ -445,7 +482,16 @@ def version(  # noqa: C901
     major_on_zero = runtime.major_on_zero
     no_verify = runtime.no_git_verify
     opts = runtime.global_cli_options
-    gha_output = VersionGitHubActionsOutput(released=False)
+    add_partial_tags = config.add_partial_tags
+    gha_output = VersionGitHubActionsOutput(
+        gh_client=hvcs_client if isinstance(hvcs_client, Github) else None,
+        mode=(
+            PersistenceMode.TEMPORARY
+            if opts.noop or (not commit_changes and not create_tag)
+            else PersistenceMode.PERMANENT
+        ),
+        released=False,
+    )
 
     forced_level_bump = None if not force_level else LevelBump.from_string(force_level)
     prerelease = is_forced_prerelease(
@@ -455,22 +501,35 @@ def version(  # noqa: C901
     )
 
     if prerelease_token:
-        log.info("Forcing use of %s as the prerelease token", prerelease_token)
+        logger.info("Forcing use of %s as the prerelease token", prerelease_token)
         translator.prerelease_token = prerelease_token
+
+    # Check if the repository is shallow and unshallow it if necessary
+    # This ensures we have the full history for commit analysis
+    project = GitProject(
+        directory=runtime.repo_dir,
+        commit_author=runtime.commit_author,
+        credential_masker=runtime.masker,
+    )
+    if project.is_shallow_clone():
+        logger.info("Repository is a shallow clone, converting to full clone...")
+        project.git_unshallow(noop=opts.noop)
 
     # Only push if we're committing changes
     if push_changes and not commit_changes and not create_tag:
-        log.info("changes will not be pushed because --no-commit disables pushing")
+        logger.info("changes will not be pushed because --no-commit disables pushing")
         push_changes &= commit_changes
 
     # Only push if we're creating a tag
     if push_changes and not create_tag and not commit_changes:
-        log.info("new tag will not be pushed because --no-tag disables pushing")
+        logger.info("new tag will not be pushed because --no-tag disables pushing")
         push_changes &= create_tag
 
     # Only make a release if we're pushing the changes
     if make_vcs_release and not push_changes:
-        log.info("No vcs release will be created because pushing changes is disabled")
+        logger.info(
+            "No vcs release will be created because pushing changes is disabled"
+        )
         make_vcs_release &= push_changes
 
     if not forced_level_bump:
@@ -484,7 +543,7 @@ def version(  # noqa: C901
                 allow_zero_version=runtime.allow_zero_version,
             )
     else:
-        log.warning(
+        logger.warning(
             "Forcing a '%s' release due to '--%s' command-line flag",
             force_level,
             (
@@ -514,14 +573,11 @@ def version(  # noqa: C901
 
     # Update GitHub Actions output value with new version & set delayed write
     gha_output.version = new_version
-    ctx.call_on_close(gha_output.write_if_possible)
+    if isinstance(hvcs_client, Github):
+        ctx.call_on_close(gha_output.write_if_possible)
 
-    # Make string variant of version && Translate to tag if necessary
-    version_to_print = (
-        str(new_version)
-        if not print_only_tag
-        else translator.str_to_tag(str(new_version))
-    )
+    # Make string variant of version or appropriate tag as necessary
+    version_to_print = str(new_version) if not print_only_tag else new_version.as_tag()
 
     # Print the new version so that command-line output capture will work
     click.echo(version_to_print)
@@ -552,6 +608,12 @@ def version(  # noqa: C901
 
     if print_only or print_only_tag:
         return
+
+    # TODO: need a better way as this is inconsistent if releasing older version patches
+    if last_release := last_released(config.repo_dir, tag_format=config.tag_format):
+        # If we have a last release, we can set the previous version for the
+        # GitHub Actions output
+        gha_output.prev_version = last_release[1]
 
     with Repo(str(runtime.repo_dir)) as git_repo:
         release_history = ReleaseHistory.from_git_history(
@@ -613,6 +675,7 @@ def version(  # noqa: C901
                     **runtime.build_command_env,
                     # PSR injected environment variables
                     "NEW_VERSION": str(new_version),
+                    "PACKAGE_NAME": runtime.project_metadata.get("name", ""),
                 },
                 noop=opts.noop,
             )
@@ -621,16 +684,32 @@ def version(  # noqa: C901
             click.echo("Build failed, aborting release", err=True)
             ctx.exit(1)
 
-    project = GitProject(
-        directory=runtime.repo_dir,
-        commit_author=runtime.commit_author,
-        credential_masker=runtime.masker,
+    license_cfg = runtime.project_metadata.get(
+        "license-expression",
+        runtime.project_metadata.get(
+            "license",
+            "",
+        ),
     )
 
-    # Preparing for committing changes
-    if commit_changes:
-        project.git_add(paths=all_paths_to_add, noop=opts.noop)
+    license_cfg = "" if not isinstance(license_cfg, (str, dict)) else license_cfg
+    license_cfg = (
+        license_cfg.get("text", "") if isinstance(license_cfg, dict) else license_cfg
+    )
 
+    gha_output.release_notes = release_notes = generate_release_notes(
+        hvcs_client,
+        release=release_history.released[new_version],
+        template_dir=runtime.template_dir,
+        history=release_history,
+        style=runtime.changelog_style,
+        mask_initial_release=runtime.changelog_mask_initial_release,
+        license_name="" if not isinstance(license_cfg, str) else license_cfg,
+    )
+
+    # Preparing for committing changes; we always stage files even if we're not committing them in order to support a two-stage commit
+    project.git_add(paths=all_paths_to_add, noop=opts.noop)
+    if commit_changes:
         # NOTE: If we haven't modified any source code then we skip trying to make a commit
         # and any tag that we apply will be to the HEAD commit (made outside of
         # running PSR
@@ -642,19 +721,24 @@ def version(  # noqa: C901
                 noop=opts.noop,
             )
         except GitCommitEmptyIndexError:
-            log.info("No local changes to add to any commit, skipping")
+            logger.info("No local changes to add to any commit, skipping")
+            commit_changes = False
 
     # Tag the version after potentially creating a new HEAD commit.
     # This way if no source code is modified, i.e. all metadata updates
     # are disabled, and the changelog generation is disabled or it's not
     # modified, then the HEAD commit will be tagged as a release commit
     # despite not being made by PSR
-    if commit_changes or create_tag:
+    if create_tag:
         project.git_tag(
             tag_name=new_version.as_tag(),
             message=new_version.as_tag(),
+            isotimestamp=commit_date.isoformat(),
             noop=opts.noop,
         )
+
+        with Repo(str(runtime.repo_dir)) as git_repo:
+            gha_output.commit_sha = git_repo.head.commit.hexsha
 
     if push_changes:
         remote_url = runtime.hvcs_client.remote_url(
@@ -662,6 +746,33 @@ def version(  # noqa: C901
         )
 
         if commit_changes:
+            # Verify that the upstream branch has not changed before pushing
+            # This prevents conflicts if another commit was pushed while we were preparing the release
+            # We check HEAD~1 because we just made a release commit
+            try:
+                project.verify_upstream_unchanged(
+                    local_ref="HEAD~1",
+                    upstream_ref=config.remote.name,
+                    noop=opts.noop,
+                )
+            except UpstreamBranchChangedError as exc:
+                click.echo(str(exc), err=True)
+                click.echo(
+                    "Upstream branch has changed. Please pull the latest changes and try again.",
+                    err=True,
+                )
+                ctx.exit(1)
+            except (
+                DetachedHeadGitError,
+                GitCommandError,
+                UnknownUpstreamBranchError,
+                GitFetchError,
+                LocalGitError,
+            ) as exc:
+                click.echo(str(exc), err=True)
+                click.echo("Unable to verify upstream due to error!", err=True)
+                ctx.exit(1)
+
             # TODO: integrate into push branch
             with Repo(str(runtime.repo_dir)) as git_repo:
                 active_branch = git_repo.active_branch.name
@@ -679,6 +790,27 @@ def version(  # noqa: C901
                 tag=new_version.as_tag(),
                 noop=opts.noop,
             )
+            # Create or update partial tags for releases
+            if add_partial_tags and not prerelease:
+                partial_tags = [new_version.as_major_tag(), new_version.as_minor_tag()]
+                # If build metadata is set, also retag the version without the metadata
+                if build_metadata:
+                    partial_tags.append(new_version.as_patch_tag())
+
+                for partial_tag in partial_tags:
+                    project.git_tag(
+                        tag_name=partial_tag,
+                        message=f"{partial_tag} => {new_version.as_tag()}",
+                        isotimestamp=commit_date.isoformat(),
+                        noop=opts.noop,
+                        force=True,
+                    )
+                    project.git_push_tag(
+                        remote_url=remote_url,
+                        tag=partial_tag,
+                        noop=opts.noop,
+                        force=True,
+                    )
 
     # Update GitHub Actions output value now that release has occurred
     gha_output.released = True
@@ -687,17 +819,8 @@ def version(  # noqa: C901
         return
 
     if not isinstance(hvcs_client, RemoteHvcsBase):
-        log.info("Remote does not support releases. Skipping release creation...")
+        logger.info("Remote does not support releases. Skipping release creation...")
         return
-
-    release_notes = generate_release_notes(
-        hvcs_client,
-        release_history.released[new_version],
-        runtime.template_dir,
-        history=release_history,
-        style=runtime.changelog_style,
-        mask_initial_release=runtime.changelog_mask_initial_release,
-    )
 
     exception: Exception | None = None
     help_message = ""
@@ -732,7 +855,7 @@ def version(  # noqa: C901
         exception = err
     finally:
         if exception is not None:
-            log.exception(exception)
+            logger.exception(exception)
             click.echo(str(exception), err=True)
             if help_message:
                 click.echo(help_message, err=True)

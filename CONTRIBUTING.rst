@@ -1,3 +1,5 @@
+.. _contributing_guide:
+
 Contributing
 ------------
 
@@ -7,17 +9,21 @@ Please remember to write tests for the cool things you create or fix.
 
 Unsure about something? No worries, `open an issue`_.
 
-.. _open an issue: https://github.com/relekang/python-semantic-release/issues/new
+.. _open an issue: https://github.com/python-semantic-release/python-semantic-release/issues/new
 
 Commit messages
 ~~~~~~~~~~~~~~~
 
 Since python-semantic-release is released with python-semantic-release we need the commit messages
-to adhere to the `angular commit guidelines`_. If you are unsure how to describe the change correctly
-just try and ask about it in your pr. If we think it should be something else or there is a
-pull-request without tags we will help out in adding or changing them.
+to adhere to the `Conventional Commits Specification`_.  Although scopes are optional, scopes are
+expected where applicable. Changes should be committed separately with the commit type they represent,
+do not combine them all into one commit.
 
-.. _angular commit guidelines: https://github.com/angular/angular.js/blob/master/DEVELOPERS.md#commits
+If you are unsure how to describe the change correctly just try and ask about it in your pr. If we
+think it should be something else or there is a pull-request without tags we will help out in
+adding or changing them.
+
+.. _Conventional Commits Specification: https://www.conventionalcommits.org/en/v1.0.0
 
 Releases
 ~~~~~~~~
