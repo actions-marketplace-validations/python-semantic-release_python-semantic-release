@@ -120,6 +120,52 @@ sure to use the correct root key depending on the configuration format you are u
 
 ----
 
+.. _config-add_partial_tags:
+
+``add_partial_tags``
+""""""""""""""""""""
+
+**Type:** ``bool``
+
+Specify if partial version tags should be handled when creating a new version. If set to
+``true``, a ``major`` and a ``major.minor`` tag will be created or updated, using the format
+specified in :ref:`tag_format`. If version has build metadata, a ``major.minor.patch`` tag
+will also be created or updated.
+
+Partial version tags are **disabled** for pre-release versions.
+
+**Example**
+
+.. code-block:: toml
+
+    [semantic_release]
+    tag_format = "v{version}"
+    add_partial_tags = true
+
+This configuration with the next version of ``1.2.3`` will result in:
+
+.. code-block:: bash
+
+    git log --decorate --oneline --graph --all
+    # * 4d4cb0a (tag: v1.2.3, tag: v1.2, tag: v1, origin/main, main) 1.2.3
+    # * 3a2b1c0 fix: some bug
+    # * 2b1c0a9 (tag: v1.2.2) 1.2.2
+    # ...
+
+If build-metadata is used, the next version of ``1.2.3+20251109`` will result in:
+
+.. code-block:: bash
+
+    git log --decorate --oneline --graph --all
+    # * 4d4cb0a (tag: v1.2.3+20251109, tag: v1.2.3, tag: v1.2, tag: v1, origin/main, main) 1.2.3+20251109
+    # * 3a2b1c0 chore: add partial tags to PSR configuration
+    # * 2b1c0a9 (tag: v1.2.3+20251031) 1.2.3+20251031
+    # ...
+
+**Default:** ``false``
+
+----
+
 .. _config-allow_zero_version:
 
 ``allow_zero_version``
@@ -1162,49 +1208,22 @@ from the :ref:`remote.name <config-remote-name>` location of your git repository
 
 ----
 
-.. _config-add_partial_tags:
+.. _config-repo_dir:
 
-``add_partial_tags``
-""""""""""""""""""""
+``repo_dir``
+""""""""""""
 
-**Type:** ``bool``
+**Type:** ``str``
 
-Specify if partial version tags should be handled when creating a new version. If set to
-``true``, a ``major`` and a ``major.minor`` tag will be created or updated, using the format
-specified in :ref:`tag_format`. If version has build metadata, a ``major.minor.patch`` tag
-will also be created or updated.
+Specify the directory of the Git repository. This is used to determine the location of
+the repository for various operations, such as creating tags and commits. PSR will attempt
+to automatically determine the location of the repository in parent directories of the
+current working directory but will emit a warning if it is higher than this defined value.
 
-Partial version tags are **disabled** for pre-release versions.
+If a git repository is not found from this location or any parent directories, PSR will
+raise an error and exit.
 
-**Example**
-
-.. code-block:: toml
-
-    [semantic_release]
-    tag_format = "v{version}"
-    add_partial_tags = true
-
-This configuration with the next version of ``1.2.3`` will result in:
-
-.. code-block:: bash
-
-    git log --decorate --oneline --graph --all
-    # * 4d4cb0a (tag: v1.2.3, tag: v1.2, tag: v1, origin/main, main) 1.2.3
-    # * 3a2b1c0 fix: some bug
-    # * 2b1c0a9 (tag: v1.2.2) 1.2.2
-    # ...
-
-If build-metadata is used, the next version of ``1.2.3+20251109`` will result in:
-
-.. code-block:: bash
-
-    git log --decorate --oneline --graph --all
-    # * 4d4cb0a (tag: v1.2.3+20251109, tag: v1.2.3, tag: v1.2, tag: v1, origin/main, main) 1.2.3+20251109
-    # * 3a2b1c0 chore: add partial tags to PSR configuration
-    # * 2b1c0a9 (tag: v1.2.3+20251031) 1.2.3+20251031
-    # ...
-
-**Default:** ``false``
+**Default:** ``"."``
 
 ----
 
@@ -1326,7 +1345,7 @@ colon-separated definition with either 2 or 3 parts. The 2-part definition inclu
 the file path and the variable name. Newly with v9.20.0, it also accepts
 an optional 3rd part to allow configuration of the format type.
 
-As of ${NEW_RELEASE_TAG}, the ``version_variables`` option also supports entire file
+As of v10.6.0, the ``version_variables`` option also supports entire file
 replacement by using an asterisk (``*``) as the pattern/variable name. This is useful
 for files that contain only a version number, such as ``VERSION`` files.
 
